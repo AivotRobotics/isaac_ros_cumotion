@@ -1,4 +1,4 @@
 [submodule "curobo_core/curobo"]
 	path = curobo_core/curobo
-	url = https://github.com/NVlabs/curobo.git
+	url = git@github.com:AivotRobotics/curobo.git
 	branch = isaac-3.2
