@@ -160,6 +160,13 @@ class CumotionRobotSegmenter(Node):
                     lambda msg, index=idx: self.camera_info_cb(msg, index), depth_info_qos)
             )
 
+        self._latest_camera_info = [None for _ in range(num_cameras)]
+        self._camera_info_publishers = [
+            self.create_publisher(CameraInfo, topic.replace('/camera_info', '/world_camera_info'),
+                                    depth_info_qos)
+            for topic in depth_camera_infos
+        ]
+
         self.mask_publishers = [
             self.create_publisher(Image, topic, mask_qos) for topic in publish_mask_topics]
         self.segmented_publishers = [
@@ -223,6 +230,8 @@ class CumotionRobotSegmenter(Node):
 
     def camera_info_cb(self, msg, idx):
         self._depth_intrinsics[idx] = msg.k
+        with self.lock:
+            self._latest_camera_info[idx] = deepcopy(msg)
 
     def publish_robot_spheres(self, traj: CuJointState):
         kin_state = self._cumotion_segmenter.robot_world.get_kinematics(traj.position)
@@ -281,6 +290,14 @@ class CumotionRobotSegmenter(Node):
             msg = self.br.cv2_to_imgmsg(segmented_depth, self._depth_encoding[idx])
             msg.header = camera_header[idx]
             self.segmented_publishers[idx].publish(msg)
+
+        # -- republish CameraInfo with segmenter publisher header stamp --
+        with self.lock: 
+            cam_info_msg = self._latest_camera_info[idx]
+        if cam_info_msg and self._camera_info_publishers[idx].get_subscription_count() > 0:
+            cam_info_to_pub = deepcopy(cam_info_msg)
+            cam_info_to_pub.header = camera_header[idx]
+            self._camera_info_publishers[idx].publish(cam_info_to_pub)
 
     def on_timer(self):
         computation_time = -1.0
