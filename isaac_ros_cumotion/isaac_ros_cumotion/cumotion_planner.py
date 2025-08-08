@@ -52,6 +52,7 @@ import torch
 from trajectory_msgs.msg import JointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
 from visualization_msgs.msg import Marker
+from curobo.util.trajectory import InterpolateType
 
 
 class CumotionActionServer(Node):
@@ -171,7 +172,7 @@ class CumotionActionServer(Node):
         )
         if include_trajopt_retract_seed:
             self.__num_trajopt_noisy_seeds = 1
-            self.__trajopt_seed_ratio = {'linear': 1.0}
+            self.__trajopt_seed_ratio = {'linear': 1.0, 'bias': 0.0}
         else:
             self.__num_trajopt_noisy_seeds = 2
             self.__trajopt_seed_ratio = {'linear': 0.5, 'bias': 0.5}
@@ -291,12 +292,6 @@ class CumotionActionServer(Node):
         tensor_args = self.tensor_args
         world_file = WorldConfig.from_dict(
             {
-                'cuboid': {
-                    'table': {
-                        'pose': [0, 0, -0.05, 1, 0, 0, 0],  # x, y, z, qw, qx, qy, qz
-                        'dims': [2.0, 2.0, 0.1],
-                    }
-                },
                 'voxel': {
                     'world_voxel': {
                         'dims': self.__grid_size_m,
@@ -319,16 +314,78 @@ class CumotionActionServer(Node):
             robot_dict,
             world_file,
             tensor_args,
-            num_graph_seeds=self.__num_graph_seeds,
-            num_trajopt_seeds=self.__num_trajopt_seeds,
+            num_graph_seeds=self.__num_graph_seeds, #default: 1
+            num_trajopt_seeds=self.__num_trajopt_seeds, #default: 1
             num_trajopt_noisy_seeds=self.__num_trajopt_noisy_seeds,
-            trajopt_tsteps=self.__num_trajopt_time_steps,
-            trajopt_seed_ratio=self.__trajopt_seed_ratio,
-            interpolation_dt=self.__interpolation_dt,
-            collision_cache=self.__collision_cache,
-            collision_checker_type=CollisionCheckerType.VOXEL,
+            trajopt_tsteps=self.__num_trajopt_time_steps, # default: 32
+            trajopt_seed_ratio=self.__trajopt_seed_ratio, # {'linear': 1.0, 'bias': 0.0}
+            interpolation_dt=self.__interpolation_dt, # 0.02
+            collision_cache=self.__collision_cache, # None
+            collision_checker_type=CollisionCheckerType.VOXEL, #CollisionCheckerType.MESH
             ee_link_name=self.__tool_frame,
-            finetune_trajopt_iters=self.__trajopt_finetune_iters,
+            finetune_trajopt_iters=self.__trajopt_finetune_iters, #None
+            num_ik_seeds = 32,
+            num_batch_ik_seeds = 32,
+            num_batch_trajopt_seeds = 1,
+            position_threshold = 0.005,
+            rotation_threshold = 0.05,
+            cspace_threshold = 0.05,
+            world_coll_checker = None,
+            base_cfg_file = "base_cfg.yml",
+            particle_ik_file = "particle_ik.yml",
+            gradient_ik_file = "gradient_ik.yml",
+            graph_file = "graph.yml",
+            particle_trajopt_file = "particle_trajopt.yml",
+            gradient_trajopt_file = "gradient_trajopt.yml",
+            finetune_trajopt_file = None,
+            interpolation_steps = 1000,
+            interpolation_type = InterpolateType.LINEAR_CUDA,
+            use_cuda_graph = True,
+            self_collision_check = True,
+            self_collision_opt = True,
+            grad_trajopt_iters = None,
+            ik_opt_iters = None,
+            ik_particle_opt = True,
+            sync_cuda_time = None,
+            trajopt_particle_opt = True,
+            traj_evaluator_config = None,
+            traj_evaluator = None,
+            minimize_jerk = True,
+            filter_robot_command = True,
+            n_collision_envs = None,
+            es_ik_learning_rate = 1.0,
+            es_trajopt_learning_rate = 1.0,
+            use_ik_fixed_samples = None,
+            use_trajopt_fixed_samples = None,
+            evaluate_interpolated_trajectory = True,
+            partial_ik_iters = 2,
+            fixed_iters_trajopt = None,
+            store_ik_debug = False,
+            store_trajopt_debug = False,
+            graph_trajopt_iters = None,
+            collision_max_outside_distance = None,
+            collision_activation_distance = 0.02,
+            trajopt_dt = 0.05,
+            js_trajopt_dt = None,
+            js_trajopt_tsteps = None,
+            trim_steps = None,
+            store_debug_in_result = False,
+            smooth_weight = None,
+            finetune_smooth_weight = None,
+            state_finite_difference_mode = None,
+            finetune_dt_scale = 0.9,
+            minimum_trajectory_dt = None,
+            maximum_trajectory_time = None,
+            maximum_trajectory_dt = None,
+            velocity_scale = None,
+            acceleration_scale = None,
+            jerk_scale = None,
+            optimize_dt = True,
+            project_pose_to_goal_frame = True,
+            ik_seed = 1531,
+            graph_seed = 1531,
+            high_precision = False,
+            use_cuda_graph_trajopt_metrics = False
         )
 
         motion_gen = MotionGen(motion_gen_config)
@@ -636,6 +693,8 @@ class CumotionActionServer(Node):
         return world_update_status
 
     def execute_callback(self, goal_handle):
+        start_time = time.time()
+
         if self.planner_busy:
             self.get_logger().error('Planner is busy')
             goal_handle.abort()
@@ -646,6 +705,7 @@ class CumotionActionServer(Node):
         self.get_logger().info('Executing goal...')
 
         # check moveit scaling factors:
+        scaling_start_time = time.time()
         min_scaling_factor = min(goal_handle.request.request.max_velocity_scaling_factor,
                                  goal_handle.request.request.max_acceleration_scaling_factor)
         time_dilation_factor = min(1.0, min_scaling_factor)
@@ -655,21 +715,29 @@ class CumotionActionServer(Node):
                 'time_dilation_factor').get_parameter_value().double_value
         self.get_logger().info('Planning with time_dilation_factor: ' +
                                str(time_dilation_factor))
+        scaling_end_time = time.time()
+        self.get_logger().info(f'Scaling factors calculation took {scaling_end_time - scaling_start_time:.4f} seconds')
+
         plan_req = goal_handle.request.request
 
         goal_handle.succeed()
-
+        world_update_start_time = time.time()
         scene = goal_handle.request.planning_options.planning_scene_diff
 
         world_objects = scene.world.collision_objects
         world_update_status = self.update_world_objects(world_objects)
+        world_update_end_time = time.time()
+        self.get_logger().info(f'World update took {world_update_end_time - world_update_start_time:.4f} seconds')
+
         result = MoveGroup.Result()
 
         if not world_update_status:
             result.error_code.val = MoveItErrorCodes.COLLISION_CHECKING_UNAVAILABLE
             self.get_logger().error('World update failed.')
             return result
+
         start_state = None
+        start_state_start_time = time.time()
         if len(plan_req.start_state.joint_state.position) > 0:
             start_state = self.motion_gen.get_active_js(
                 CuJointState.from_position(
@@ -709,7 +777,10 @@ class CumotionActionServer(Node):
                 start_state.velocity += current_joint_state.velocity
             else:
                 start_state = current_joint_state
+        start_state_end_time = time.time()
+        self.get_logger().info(f'Start state calculation took {start_state_end_time - start_state_start_time:.4f} seconds')
 
+        goal_pose_start_time = time.time()
         if len(plan_req.goal_constraints[0].joint_constraints) > 0:
             self.get_logger().info('Calculating goal pose from Joint target')
             goal_config = [
@@ -775,16 +846,23 @@ class CumotionActionServer(Node):
                 return result
         else:
             self.get_logger().error('Goal constraints not supported')
+        goal_pose_end_time = time.time()
+        self.get_logger().info(f'Goal pose calculation took {goal_pose_end_time - goal_pose_start_time:.4f} seconds')
+
         with self.lock:
             self.planner_busy = True
 
+        planning_start_time = time.time()
         self.motion_gen.reset(reset_seed=False)
         motion_gen_result = self.motion_gen.plan_single(
             start_state,
             goal_pose,
-            MotionGenPlanConfig(max_attempts=self.__max_attempts, enable_graph_attempt=1,
-                                time_dilation_factor=time_dilation_factor),
+            MotionGenPlanConfig(max_attempts=self.__max_attempts, enable_graph_attempt=3,
+                                time_dilation_factor=time_dilation_factor, ik_fail_return= 5),
         )
+        planning_end_time = time.time()
+        self.get_logger().info(f'Motion planning took {planning_end_time - planning_start_time:.4f} seconds')
+
         with self.lock:
             self.planner_busy = False
         result = MoveGroup.Result()
@@ -824,6 +902,10 @@ class CumotionActionServer(Node):
             + str(motion_gen_result.status)
         )
         self.__query_count += 1
+
+        total_execution_time = time.time() - start_time
+        self.get_logger().info(f'Total execution time for execute_callback: {total_execution_time:.4f} seconds')
+
         return result
 
     def publish_voxels(self, voxels):
