@@ -109,9 +109,9 @@ class CumotionActionServer(Node):
         # === MPC params ===
         self.declare_parameter('use_mpc', True)
         self.declare_parameter('mpc_autorun', True)
-        self.declare_parameter('mpc_step_dt', 0.1) #(10 Hz)
+        self.declare_parameter('mpc_step_dt', 0.03)
         self.declare_parameter('mpc_cmd_topic', '/ur_arm_controller/joint_trajectory')  # change if your controller differs
-        self.declare_parameter('mpc_world_update_period', 0.10)
+        self.declare_parameter('mpc_world_update_period', 0.1)
 
         self.__voxel_pub = self.create_publisher(Marker, '/curobo/voxels', 10)
         self.planner_busy = False
@@ -391,7 +391,7 @@ class CumotionActionServer(Node):
             use_cuda_graph_metrics=True,
             use_cuda_graph_full_step=False,
             self_collision_check=True,
-            #collision_activation_distance=0.004,
+            collision_activation_distance=0.05,
             compute_metrics=True
         )
 
@@ -498,12 +498,12 @@ class CumotionActionServer(Node):
         if self.__js_buffer['velocity'] and len(self.__js_buffer['velocity']) == len(self.__js_buffer['position']):
             state.velocity = self.tensor_args.to_device(self.__js_buffer['velocity']).unsqueeze(0)
         current_state = self.mpc.get_active_js(state)
-        self.get_logger().info(f'Current state: {current_state}')
+        #self.get_logger().info(f'Current state: {current_state}')
 
         # Compute goal from motion_gen_result last point
         if self._motion_gen_result is not None:
             last_point = self._motion_gen_result.joint_trajectory.points[-1]
-            self.get_logger().info(f'Last point: {last_point}')
+            #self.get_logger().info(f'Last point: {last_point}')
 
             pos = torch.as_tensor(last_point.positions, dtype=torch.float32)
             pos = pos.unsqueeze(0).to(self.mpc.tensor_args.device)
@@ -512,7 +512,7 @@ class CumotionActionServer(Node):
                 position=pos,
                 joint_names=self._motion_gen_result.joint_trajectory.joint_names
             )
-            self.get_logger().info(f'Goal state: {goal_js}')
+            #self.get_logger().info(f'Goal state: {goal_js}')
 
             # compute goal pose using forward kinematics
             goal_pose = self.motion_gen.compute_kinematics(goal_js).ee_pose.clone()
@@ -529,12 +529,16 @@ class CumotionActionServer(Node):
                 self.mpc.update_goal(self.goal_buffer)
                 self._update_goal = False
 
-            seed_traj = self.build_seed_tensor_from_moveit(self._motion_gen_result.joint_trajectory, self.mpc)
+            #seed_traj = self.build_seed_tensor_from_moveit(self._motion_gen_result.joint_trajectory, self.mpc)
             mpc_result = self.mpc.step(current_state, max_attempts=2)
-            #current_error = mpc_result.metrics.pose_error.item()
+            
+            pose_error = mpc_result.metrics.pose_error.item()
+            rotation_error = mpc_result.metrics.rotation_error.item()
+            self.get_logger().info(f'MPC pose error: {pose_error}')
+            self.get_logger().info(f'MPC rotation error: {rotation_error}')
 
             cmd_state_full = mpc_result.js_action
-            self.get_logger().info(f'MPC command joint state: {cmd_state_full}')
+            #self.get_logger().info(f'MPC command joint state: {cmd_state_full}')
 
             # Filter out any invalid joint states comparing with current_state
             valid_positions = []
@@ -549,8 +553,8 @@ class CumotionActionServer(Node):
                 joint_names=valid_names
             )
 
-            self.get_logger().info(f'MPC command filtered joint state: {cmd_state_filtered}')
-            self.get_logger().info(f'MPC result: {mpc_result}')
+            #self.get_logger().info(f'MPC command filtered joint state: {cmd_state_filtered}')
+            #self.get_logger().info(f'MPC result: {mpc_result}')
 
             # Publish command state to joint controller
             if cmd_state_filtered is not None:
