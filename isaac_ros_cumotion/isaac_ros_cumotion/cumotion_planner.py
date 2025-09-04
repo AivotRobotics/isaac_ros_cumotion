@@ -111,7 +111,7 @@ class CumotionActionServer(Node):
         self.declare_parameter('mpc_autorun', True)
         self.declare_parameter('mpc_step_dt', 0.03)
         self.declare_parameter('mpc_cmd_topic', '/ur_arm_controller/joint_trajectory')  # change if your controller differs
-        self.declare_parameter('mpc_world_update_period', 0.1)
+        self.declare_parameter('mpc_world_update_period', 0.15)
 
         self.__voxel_pub = self.create_publisher(Marker, '/curobo/voxels', 10)
         self.planner_busy = False
