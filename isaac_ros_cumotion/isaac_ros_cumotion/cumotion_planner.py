@@ -90,20 +90,13 @@ class CumotionActionServer(Node):
         self.declare_parameter('override_moveit_scaling_factors', False)
         self.declare_parameter('update_link_sphere_server', 'planner_attach_object')
 
+        # MPPI rollout viz
+        self.declare_parameter('viz_enable_mppi_rollouts', True)
+        self.declare_parameter('viz_rollouts_topic', '/mpc_rollouts')
+        self._viz_enable_mppi_rollouts = self.get_parameter('viz_enable_mppi_rollouts').get_parameter_value().bool_value
+        self._viz_rollouts_topic = self.get_parameter('viz_rollouts_topic').get_parameter_value().string_value
+        self._viz_rollouts_pub = self.create_publisher(Marker, self._viz_rollouts_topic, 10)
 
-        # --- Visualization params/publishers ---
-        self.declare_parameter('viz_enable_display', True)     # publish MoveIt DisplayTrajectory
-        self.declare_parameter('viz_display_topic', '/display_planned_path')
-        self.declare_parameter('viz_enable_ee_marker', False)  # optional: end-effector LINE_STRIP
-        self.declare_parameter('viz_ee_topic', '/mpc_ee_path')
-
-        self._viz_enable_display = self.get_parameter('viz_enable_display').get_parameter_value().bool_value
-        self._viz_display_topic = self.get_parameter('viz_display_topic').get_parameter_value().string_value
-        self._viz_enable_ee_marker = self.get_parameter('viz_enable_ee_marker').get_parameter_value().bool_value
-        self._viz_ee_topic = self.get_parameter('viz_ee_topic').get_parameter_value().string_value
-
-        self._viz_display_pub = self.create_publisher(DisplayTrajectory, self._viz_display_topic, 10)
-        self._viz_ee_pub = self.create_publisher(Marker, self._viz_ee_topic, 10)
 
 
         # === MPC params ===
@@ -231,7 +224,7 @@ class CumotionActionServer(Node):
         self.__js_buffer = None
 
         # Viz timer
-        self.timer = self.create_timer(0.01, self.on_timer)
+        self.timer = self.create_timer(self._mpc_step_dt/2, self.viz_timer)
 
         # MPC publisher & timer
         self._mpc_cmd_pub = self.create_publisher(JointTrajectory, self._mpc_cmd_topic, 10)
@@ -249,61 +242,61 @@ class CumotionActionServer(Node):
 
     # ------------------- Callbacks / Helpers -------------------
 
-    def _publish_display_from_joint_traj(self, jt: JointTrajectory, start_state_js: CuJointState = None):
-        if not self._viz_enable_display or self._viz_display_pub.get_subscription_count() < 1:
+    def _publish_mppi_rollouts(self):
+        if not self._viz_enable_mppi_rollouts or self._viz_rollouts_pub.get_subscription_count() < 1:
             return
-        disp = DisplayTrajectory()
-
-        # trajectory_start: use measured/current as a safe start
-        rs = RobotState()
         try:
-            if start_state_js is not None:
-                rs = self._robot_state_from_js(start_state_js)
-            else:
-                # fall back to current /joint_states
-                if self.__js_buffer:
-                    rs.joint_state.name = list(self.__js_buffer['joint_names'])
-                    rs.joint_state.position = list(self.__js_buffer['position'])
+            r = self.mpc.solver.get_rollouts()  # requires store_rollouts=True
         except Exception:
-            pass
-        disp.trajectory_start = rs
-
-        rtraj = RobotTrajectory()
-        rtraj.joint_trajectory = jt
-        disp.trajectory = [rtraj]
-        self._viz_display_pub.publish(disp)
-
-    def _publish_ee_marker_from_chunk(self, q_list, joint_names_ctrl):
-        if not self._viz_enable_ee_marker or self._viz_ee_pub.get_subscription_count() < 1:
             return
-        # Build LINE_STRIP in robot base frame
+        if r is None:
+            return
+
+         # Tensor directly from solver
+        t = r
+        # Accept [H,3] or [B,H,3]
+        if t.ndim == 2 and t.shape[-1] == 3:
+            ee = t.unsqueeze(0)
+        elif t.ndim == 3 and t.shape[-1] == 3:
+            ee = t
+        elif t.ndim >= 2 and t.shape[-1] == len(self.mpc.rollout_fn.joint_names):
+            # Looks like joint rollouts -> FK fallback
+            if t.ndim == 2:
+                t = t.unsqueeze(0)
+            B, H, DoF = t.shape[:3]
+            js = CuJointState.from_position(
+                position=t.reshape(-1, DoF),
+                joint_names=list(self.mpc.rollout_fn.joint_names),
+            )
+            ee_pose = self.motion_gen.compute_kinematics(js).ee_pose
+            ee = ee_pose.position().view(B, H, 3)
+        
+        # --- Build and publish the Marker ---
+
+        B, H, _ = ee.shape
+        stride_h = max(1, H // 30)   # ~30 points per rollout
+        stride_b = 1                 # thin batches if needed
+
         m = Marker()
-        m.header.frame_id = self.__robot_base_frame
+        m.header.frame_id = self.__robot_base_frame  # ensure this matches the frame of 'ee'
         m.header.stamp = self.get_clock().now().to_msg()
-        m.ns = '' # TODO
-        m.id = 1
-        m.type = Marker.LINE_STRIP
+        m.ns = 'mpc_rollouts'
+        m.id = 0
+        m.type = Marker.POINTS
         m.action = Marker.ADD
-        m.scale.x = 0.005  # 5mm line
-        m.color.r = 0.1; m.color.g = 0.8; m.color.b = 1.0; m.color.a = 0.9
+        m.scale.x = 0.01  # 1 cm
+        m.scale.y = 0.01
+        m.color.g = 1.0
+        m.color.a = 0.9
+        m.lifetime = Duration(seconds=0.4).to_msg()  # a touch longer; tweak to taste
 
-        # Sample sparsely for speed
-        stride = max(1, len(q_list) // 100)
-        for k in range(0, len(q_list), stride):
-            qk = q_list[k]
-            try:
-                js = CuJointState.from_position(
-                    position=self.tensor_args.to_device(qk).view(1, -1),
-                    joint_names=joint_names_ctrl
-                )
-                ee = self.motion_gen.compute_kinematics(js).ee_pose
-                x, y, z = ee.position()[0].tolist()
+        ee_cpu = ee.detach().cpu().numpy()
+        for b in range(0, B, stride_b):
+            for t in range(0, H, stride_h):
+                x, y, z = ee_cpu[b, t, :]
                 m.points.append(Point(x=float(x), y=float(y), z=float(z)))
-            except Exception:
-                continue
 
-        self._viz_ee_pub.publish(m)
-
+        self._viz_rollouts_pub.publish(m)
 
     def js_callback(self, msg):
         self.__js_buffer = {'joint_names': msg.name, 'position': msg.position, 'velocity': msg.velocity}
@@ -403,7 +396,7 @@ class CumotionActionServer(Node):
         self.motion_gen.warmup(enable_graph=True)
         self.get_logger().info('cuMotion is ready for planning queries!')
 
-    def on_timer(self):
+    def viz_timer(self):
         with self.lock:
             if self.__js_buffer is None:
                 return
@@ -415,6 +408,7 @@ class CumotionActionServer(Node):
             tensor_args=self.__tensor_args,
             rgb=[0.0, 1.0, 1.0, 1.0]
         )
+        self._publish_mppi_rollouts()
 
     # --- Build a safe RobotState for MoveIt result to avoid segfaults ---
     def _robot_state_from_js(self, js: CuJointState) -> RobotState:
@@ -534,8 +528,8 @@ class CumotionActionServer(Node):
             
             pose_error = mpc_result.metrics.pose_error.item()
             rotation_error = mpc_result.metrics.rotation_error.item()
-            self.get_logger().info(f'MPC pose error: {pose_error}')
-            self.get_logger().info(f'MPC rotation error: {rotation_error}')
+            #self.get_logger().info(f'MPC pose error: {pose_error}')
+            #self.get_logger().info(f'MPC rotation error: {rotation_error}')
 
             cmd_state_full = mpc_result.js_action
             #self.get_logger().info(f'MPC command joint state: {cmd_state_full}')
@@ -573,6 +567,10 @@ class CumotionActionServer(Node):
                         time_from_start=Duration(seconds=self._mpc_step_dt).to_msg()
                     ))
                 self._mpc_cmd_pub.publish(joint_trajectory_msg)
+                # Compute total execution time
+                #total_execution_time = time.time() - now
+                #self.get_logger().info(f'Total execution time: {total_execution_time:.4f} seconds')
+
 
         # ------------------- ESDF / World -------------------
 
