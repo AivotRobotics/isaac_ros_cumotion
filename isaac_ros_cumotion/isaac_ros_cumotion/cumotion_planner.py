@@ -102,7 +102,7 @@ class CumotionActionServer(Node):
         # === MPC params ===
         self.declare_parameter('use_mpc', True)
         self.declare_parameter('mpc_autorun', True)
-        self.declare_parameter('mpc_step_dt', 0.03)
+        self.declare_parameter('mpc_step_dt', 0.04) # 0.03 for pose control
         self.declare_parameter('mpc_cmd_topic', '/ur_arm_controller/joint_trajectory')  # change if your controller differs
         self.declare_parameter('mpc_world_update_period', 0.15)
 
@@ -499,28 +499,37 @@ class CumotionActionServer(Node):
             last_point = self._motion_gen_result.joint_trajectory.points[-1]
             #self.get_logger().info(f'Last point: {last_point}')
 
-            pos = torch.as_tensor(last_point.positions, dtype=torch.float32)
-            pos = pos.unsqueeze(0).to(self.mpc.tensor_args.device)
+            pos = torch.as_tensor(last_point.positions, dtype=torch.float32).unsqueeze(0).to(self.mpc.tensor_args.device)
 
-            goal_js = CuJointState.from_position(
+            goal_js_mg = CuJointState.from_position(
                 position=pos,
                 joint_names=self._motion_gen_result.joint_trajectory.joint_names
             )
+            goal_js = self.mpc.get_active_js(goal_js_mg)
             #self.get_logger().info(f'Goal state: {goal_js}')
 
             # compute goal pose using forward kinematics
             goal_pose = self.motion_gen.compute_kinematics(goal_js).ee_pose.clone()
 
+            retract = goal_js.position
+            if retract.ndim == 1:
+                retract = retract.unsqueeze(0)
+            retract = retract.detach().clone().to(self.mpc.tensor_args.device)
+
             if self._update_goal:
                 goal = Goal(
                     current_state=current_state,
                     goal_state=goal_js,
-                    goal_pose=goal_pose
+                    goal_pose=goal_pose,
+                    retract_state=retract
                 )
-
+                self.mpc.enable_pose_cost(enable=True)
+                self.mpc.enable_cspace_cost(enable=True)
                 self.goal_buffer = self.mpc.setup_solve_single(goal, 1)
                 self.goal_buffer.goal_state.copy_(goal_js)
                 self.mpc.update_goal(self.goal_buffer)
+
+
                 self._update_goal = False
 
             #seed_traj = self.build_seed_tensor_from_moveit(self._motion_gen_result.joint_trajectory, self.mpc)
@@ -528,8 +537,8 @@ class CumotionActionServer(Node):
             
             pose_error = mpc_result.metrics.pose_error.item()
             rotation_error = mpc_result.metrics.rotation_error.item()
-            #self.get_logger().info(f'MPC pose error: {pose_error}')
-            #self.get_logger().info(f'MPC rotation error: {rotation_error}')
+            self.get_logger().info(f'MPC pose error: {pose_error}')
+            self.get_logger().info(f'MPC rotation error: {rotation_error}')
 
             cmd_state_full = mpc_result.js_action
             #self.get_logger().info(f'MPC command joint state: {cmd_state_full}')
