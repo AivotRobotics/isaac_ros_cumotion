@@ -16,7 +16,6 @@ from curobo.geom.types import WorldConfig
 from curobo.types.base import TensorDeviceType
 from curobo.types.math import Pose
 from curobo.types.state import JointState as CuJointState
-from curobo.util.logger import setup_curobo_logger
 from curobo.util.trajectory import InterpolateType
 from curobo.wrap.reacher.motion_gen import (
     MotionGen, MotionGenConfig, MotionGenPlanConfig, MotionGenStatus
@@ -34,7 +33,7 @@ from isaac_ros_cumotion_python_utils.utils import (
 )
 
 from moveit_msgs.action import MoveGroup
-from moveit_msgs.msg import CollisionObject, MoveItErrorCodes, RobotTrajectory, RobotState, DisplayTrajectory
+from moveit_msgs.msg import CollisionObject, MoveItErrorCodes, RobotTrajectory
 
 from nvblox_msgs.srv import EsdfAndGradients
 from rclpy.action import ActionServer
@@ -47,7 +46,6 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from visualization_msgs.msg import Marker
 
 from rclpy.duration import Duration
-from rclpy.time import Time
 
 
 class CumotionActionServer(Node):
@@ -102,9 +100,45 @@ class CumotionActionServer(Node):
         # === MPC params ===
         self.declare_parameter('use_mpc', True)
         self.declare_parameter('mpc_autorun', True)
-        self.declare_parameter('mpc_step_dt', 0.04) # 0.03 for pose control
+        self.declare_parameter('mpc_step_dt', 0.03) # 0.03 for pose control
         self.declare_parameter('mpc_cmd_topic', '/ur_arm_controller/joint_trajectory')  # change if your controller differs
         self.declare_parameter('mpc_world_update_period', 0.15)
+        # Optional command smoothing to reduce jerkiness
+        self.declare_parameter('mpc_cmd_smoothing_alpha', 0.35)
+        self.declare_parameter('mpc_cmd_max_step', 0.08)
+        # Progress watchdog: skip ahead if stalled
+        self.declare_parameter('mpc_stall_ticks', 15)          # ticks without advancing before forcing jump
+        self.declare_parameter('mpc_stall_jump_points', 3)     # points to jump ahead when stalled
+        self._mg_path = None     # dict with EE xyz [N,3], s [N], q_mpc [N,DoF], names, etc.
+        self._ema_pose_err = 0.0 # for adaptive look-ahead
+        self._endgame = False
+        self._cmd_alpha = float(self.get_parameter('mpc_cmd_smoothing_alpha').get_parameter_value().double_value)
+        self._cmd_max_step = float(self.get_parameter('mpc_cmd_max_step').get_parameter_value().double_value)
+        self._last_cmd_pos = None
+        self._stall_ticks_thresh = int(self.get_parameter('mpc_stall_ticks').get_parameter_value().integer_value)
+        self._stall_jump_pts = int(self.get_parameter('mpc_stall_jump_points').get_parameter_value().integer_value)
+        if self._stall_ticks_thresh < 1:
+            self._stall_ticks_thresh = 15
+        if self._stall_jump_pts < 1:
+            self._stall_jump_pts = 2
+        self._stall_counter = 0
+
+        # Look-ahead parameters
+        self.declare_parameter('mpc_lookahead_m', 0.35)           # nominal 20 cm
+        self.declare_parameter('mpc_min_lookahead_voxels', 4)     # >= 3 * voxel_size
+        self._mpc_lookahead_m = self.get_parameter('mpc_lookahead_m').get_parameter_value().double_value
+        self._mpc_min_lookahead_voxels = self.get_parameter('mpc_min_lookahead_voxels').get_parameter_value().integer_value
+        self._goal = None
+
+        # Forward-only progress tracking ---
+        self._la_last_idx = 0        # last index we accepted (monotonic)
+        self._s_progress = 0.0       # last arclength we accepted (monotonic)
+        self._backtrack_pts = 5      # allow tiny look-back window to avoid getting stuck
+        self._finish_margin_m = 0.02 # when this close to final EE, snap to the end
+        self._last_goal_idx = -1     # last goal index sent to MPC
+        self._s_tgt = 0.0            # latest target arclength used for lookahead
+        self._last_goal_s = -1.0     # last arclength sent to MPC
+        self._min_goal_step_s = 1e-3 # initialize; will update after __voxel_size is read
 
         self.__voxel_pub = self.create_publisher(Marker, '/curobo/voxels', 10)
         self.planner_busy = False
@@ -171,6 +205,8 @@ class CumotionActionServer(Node):
         self.__use_aabb_on_request = self.get_parameter('use_aabb_on_request').get_parameter_value().bool_value
         self.__publish_voxel_size = self.get_parameter('publish_voxel_size').get_parameter_value().double_value
         self.__voxel_size = self.get_parameter('voxel_size').get_parameter_value().double_value
+        # now that voxel size is known, set a sensible min arclength step for goal updates
+        self._min_goal_step_s = max(1e-3, 0.5 * self.__voxel_size)
         self._update_link_sphere_server = self.get_parameter('update_link_sphere_server').get_parameter_value().string_value
         self.__esdf_client = None
         self.__esdf_req = None
@@ -214,8 +250,8 @@ class CumotionActionServer(Node):
         self._mpc_active = False
         self._update_goal = False
         self._motion_gen_result = None
-        self._mpc_goal_buf = None
         self._last_world_update_ts = 0.0
+        self.goal_buffer = None
 
         # ROS I/O
         self.subscription = self.create_subscription(
@@ -241,6 +277,42 @@ class CumotionActionServer(Node):
         self._action_server = ActionServer(self, MoveGroup, 'cumotion/move_group', self.execute_callback)
 
     # ------------------- Callbacks / Helpers -------------------
+
+    def _precompute_mg_path(self, traj: RobotTrajectory):
+        """Precompute EE path and cumulative arclength for MG trajectory, and
+        cache joint positions reordered to MPC joint order."""
+        jt = traj.joint_trajectory
+        assert len(jt.points) > 0
+        moveit_jn = list(jt.joint_names)
+        mpc_jn    = list(self.mpc.rollout_fn.joint_names)
+        idx       = [moveit_jn.index(j) for j in mpc_jn]
+
+        # Joint matrix [N, DoF] in MPC order
+        q = np.array([p.positions for p in jt.points], dtype=np.float32)[:, idx]
+        q_t = torch.from_numpy(q).to(device=self.mpc.tensor_args.device)
+        q_t = q_t.contiguous()  # <-- add this
+
+        # FK -> EE positions [N,3]
+        js = CuJointState.from_position(position=q_t, joint_names=mpc_jn)
+        ee = (self.motion_gen.compute_kinematics(js)
+            .ee_pose.position
+            .detach().cpu().numpy())
+
+        # cumulative arclength s
+        diffs = ee[1:] - ee[:-1]
+        seg   = np.linalg.norm(diffs, axis=1)
+        s     = np.concatenate([[0.0], np.cumsum(seg)])
+
+        self._mg_path = {
+            'q_mpc': q_t,       # torch [N,DoF]
+            'ee': ee,           # np  [N,3]
+            's': s,             # np  [N]
+            'mpc_names': mpc_jn # list[str]
+        }
+        self._la_last_idx = 0
+        self._s_progress = 0.0
+        self._endgame = False # reset on new path
+        self._last_cmd_pos = None
 
     def _publish_mppi_rollouts(self):
         if not self._viz_enable_mppi_rollouts or self._viz_rollouts_pub.get_subscription_count() < 1:
@@ -269,7 +341,7 @@ class CumotionActionServer(Node):
                 joint_names=list(self.mpc.rollout_fn.joint_names),
             )
             ee_pose = self.motion_gen.compute_kinematics(js).ee_pose
-            ee = ee_pose.position().view(B, H, 3)
+            ee = ee_pose.position.contiguous().view(B, H, 3)
         
         # --- Build and publish the Marker ---
 
@@ -410,57 +482,52 @@ class CumotionActionServer(Node):
         )
         self._publish_mppi_rollouts()
 
-    # --- Build a safe RobotState for MoveIt result to avoid segfaults ---
-    def _robot_state_from_js(self, js: CuJointState) -> RobotState:
-        rs = RobotState()
-        rs.joint_state.name = list(js.joint_names)
-        pos = js.position.view(-1, js.position.shape[-1]).detach().cpu().numpy()
-        rs.joint_state.position = pos[-1].tolist()
-        # only attach velocity if sizes match (MoveIt is picky)
-        if js.velocity is not None and js.velocity.numel() == js.position.numel():
-            vel = js.velocity.view(-1, js.position.shape[-1]).detach().cpu().numpy()
-            rs.joint_state.velocity = vel[-1].tolist()
-        return rs
 
+    def _pick_lookahead_index(self, current_ee_xyz: np.ndarray) -> int:
+        """Return an index >= last accepted index, aiming at s_progress + lookahead."""
+        if self._mg_path is None:
+            return -1
 
-    def build_seed_tensor_from_moveit(self, jt, mpc) -> torch.Tensor:
-        """Return a [1, H, DoF] tensor in MPC joint order, interpolated to MPC horizon."""
-        moveit_jn = list(jt.joint_names)
-        mpc_jn    = list(mpc.rollout_fn.joint_names)
-        idx = [moveit_jn.index(j) for j in mpc_jn]  # reorder columns to MPC order
+        ee = self._mg_path['ee']
+        s  = self._mg_path['s']
+        N  = len(s)
 
-        pts = jt.points
-        assert len(pts) > 0, "Empty trajectory"
+        # --- nearest within a forward-biased window ---
+        lb = max(0, self._la_last_idx - self._backtrack_pts)
+        ub = N  # you can clamp to a forward window if you like (e.g. self._la_last_idx+400)
 
-        # source times (s) and positions [N, DoF_mpc]
-        t_src = np.array([p.time_from_start.sec + p.time_from_start.nanosec * 1e-9 for p in pts], dtype=np.float32)
-        # ensure strictly non-decreasing (handles duplicated 0.0 stamps)
-        t_src = np.maximum.accumulate(t_src + np.linspace(0, 1e-6*(len(pts)-1), len(pts), dtype=np.float32))
-        q_src = np.array([p.positions for p in pts], dtype=np.float32)[:, idx]
+        # nearest search only in [lb, ub)
+        d = np.linalg.norm(ee[lb:ub] - current_ee_xyz[None, :], axis=1)
+        i_near = lb + int(np.argmin(d))
 
-        # MPC horizon/dt introspection
-        rf = mpc.rollout_fn
-        H  = getattr(rf, "horizon", getattr(rf, "traj_T", getattr(rf, "n_steps", len(pts))))
-        dt = getattr(rf, "dt", getattr(rf, "traj_dt", getattr(rf, "base_dt", None)))
+        # never move progress backward
+        s_cur = max(float(s[i_near]), float(self._s_progress))
 
-        if dt is not None:
-            t_tgt = np.arange(H, dtype=np.float32) * float(dt)
-            if t_src[-1] <= 0:
-                t_tgt[:] = 0.0
-        else:
-            t_end = float(t_src[-1]) if t_src[-1] > 0 else 1e-3
-            t_tgt = np.linspace(0.0, t_end, H, dtype=np.float32)
+        # compute look-ahead distance (respect voxel size & adaptive reduction)
+        min_la = max(self._mpc_lookahead_m,
+                    self._mpc_min_lookahead_voxels * float(self.__voxel_size))
+        la = max(min_la * (0.6 if self._ema_pose_err > 0.12 else 1.0), 0.05)
+        # Clamp lookahead by remaining distance to goal for end smoothing
+        end_dist = float(np.linalg.norm(current_ee_xyz - ee[-1]))
+        la = min(la, max(0.5 * self._finish_margin_m, 0.6 * end_dist))
 
-        # interpolate onto MPC horizon
-        dof = q_src.shape[1]
-        q_seed = np.empty((H, dof), dtype=np.float32)
-        for j in range(dof):
-            q_seed[:, j] = np.interp(t_tgt, t_src, q_src[:, j])
+        s_tgt = min(s_cur + la, float(s[-1]))
+        j = int(np.searchsorted(s, s_tgt, side='left'))
+        # store for downstream interpolation/gating
+        self._s_tgt = s_tgt
 
-        # to torch: [1, H, DoF] on the right device
-        return torch.from_numpy(q_seed).to(device=mpc.tensor_args.device) \
-                                    .unsqueeze(0)  # [1,H,DoF]
+        # enforce forward motion
+        j = max(j, i_near, self._la_last_idx)
+        j = min(j, N - 1)
 
+        # update monotonic progress (a touch of hysteresis)
+        self._s_progress = max(self._s_progress, float(s[i_near]))
+        self._la_last_idx = max(self._la_last_idx, j - 1)
+
+        # snap to the very end if we're close to final
+        if np.linalg.norm(current_ee_xyz - ee[-1]) <= self._finish_margin_m:
+            return N - 1
+        return j
 
     def mpc_tick(self):
 
@@ -494,21 +561,58 @@ class CumotionActionServer(Node):
         current_state = self.mpc.get_active_js(state)
         #self.get_logger().info(f'Current state: {current_state}')
 
-        # Compute goal from motion_gen_result last point
+        # Compute look-ahead goal from MG path
         if self._motion_gen_result is not None:
-            last_point = self._motion_gen_result.joint_trajectory.points[-1]
-            #self.get_logger().info(f'Last point: {last_point}')
+            if self._mg_path is None:
+                try:
+                    self._precompute_mg_path(self._motion_gen_result)
+                except Exception as e:
+                    self.get_logger().warn(f'Failed to precompute MG path: {e}')
+                    return
 
-            pos = torch.as_tensor(last_point.positions, dtype=torch.float32).unsqueeze(0).to(self.mpc.tensor_args.device)
+            # Current EE position
+            ee_cur = self.motion_gen.compute_kinematics(current_state).ee_pose.position \
+                        .detach().cpu().numpy().reshape(3)
 
-            goal_js_mg = CuJointState.from_position(
-                position=pos,
-                joint_names=self._motion_gen_result.joint_trajectory.joint_names
-            )
-            goal_js = self.mpc.get_active_js(goal_js_mg)
-            #self.get_logger().info(f'Goal state: {goal_js}')
+            j_idx = self._pick_lookahead_index(ee_cur)
 
-            # compute goal pose using forward kinematics
+            # endgame freeze: once we hit the final waypoint, keep it there
+            N = len(self._mg_path['s'])
+            if j_idx == N - 1:
+                self._endgame = True
+                self.get_logger().info('MPC in endgame mode (final waypoint reached).')
+
+            if self._endgame:
+                j_idx = N - 1
+
+            # If we haven't advanced index for a while, force a jump forward
+            if j_idx <= self._last_goal_idx:
+                self._stall_counter += 1
+            else:
+                self._stall_counter = 0
+            if self._stall_counter >= self._stall_ticks_thresh and not self._endgame:
+                forced_idx = min(N - 1, self._last_goal_idx + self._stall_jump_pts)
+                if forced_idx > j_idx:
+                    j_idx = forced_idx
+                    # keep target arclength consistent with forced index
+                    try:
+                        self._s_tgt = float(self._mg_path['s'][j_idx])
+                    except Exception:
+                        pass
+                self._stall_counter = 0
+
+            # Build goal_js / goal_pose from MG path at j_idx using arclength interpolation
+            q_path = self._mg_path['q_mpc']              # [N, DoF]
+            s_path = self._mg_path['s']                  # [N]
+            if j_idx <= 0:
+                j0, j1, alpha = 0, 0, 1.0
+            else:
+                j1 = j_idx
+                j0 = max(0, j1 - 1)
+                ds = float(max(s_path[j1] - s_path[j0], 1e-6))
+                alpha = float(np.clip((self._s_tgt - float(s_path[j0])) / ds, 0.0, 1.0))
+            qj = (q_path[j0:j0+1, :] * (1.0 - alpha) + q_path[j1:j1+1, :] * alpha).contiguous()
+            goal_js = CuJointState.from_position(position=qj, joint_names=self._mg_path['mpc_names'])
             goal_pose = self.motion_gen.compute_kinematics(goal_js).ee_pose.clone()
 
             retract = goal_js.position
@@ -516,29 +620,71 @@ class CumotionActionServer(Node):
                 retract = retract.unsqueeze(0)
             retract = retract.detach().clone().to(self.mpc.tensor_args.device)
 
-            if self._update_goal:
-                goal = Goal(
-                    current_state=current_state,
-                    goal_state=goal_js,
-                    goal_pose=goal_pose,
-                    retract_state=retract
-                )
-                self.mpc.enable_pose_cost(enable=True)
-                self.mpc.enable_cspace_cost(enable=True)
-                self.goal_buffer = self.mpc.setup_solve_single(goal, 1)
-                self.goal_buffer.goal_state.copy_(goal_js)
-                self.mpc.update_goal(self.goal_buffer)
-
-
-                self._update_goal = False
-
-            #seed_traj = self.build_seed_tensor_from_moveit(self._motion_gen_result.joint_trajectory, self.mpc)
-            mpc_result = self.mpc.step(current_state, max_attempts=2)
+            goal = Goal(
+                current_state=current_state,
+                goal_state=goal_js,
+                goal_pose=goal_pose,
+                retract_state=retract
+            )
             
-            pose_error = mpc_result.metrics.pose_error.item()
+            # Always refresh goal for smooth streaming, but avoid re-allocating the buffer
+            need_setup = (self.goal_buffer is None) or self._update_goal
+            try:
+                if not need_setup:
+                    # Update goal buffer in-place if supported (attr or dict-like)
+                    if hasattr(self.goal_buffer, 'goal_state'):
+                        self.goal_buffer.goal_state = goal_js
+                        if hasattr(self.goal_buffer, 'goal_pose'):
+                            self.goal_buffer.goal_pose = goal_pose
+                        if hasattr(self.goal_buffer, 'retract_state'):
+                            self.goal_buffer.retract_state = retract
+                    elif isinstance(self.goal_buffer, dict):
+                        if 'goal_state' in self.goal_buffer:
+                            self.goal_buffer['goal_state'] = goal_js
+                        if 'goal_pose' in self.goal_buffer:
+                            self.goal_buffer['goal_pose'] = goal_pose
+                        if 'retract_state' in self.goal_buffer:
+                            self.goal_buffer['retract_state'] = retract
+                    else:
+                        need_setup = True
+            except Exception:
+                need_setup = True
+
+            if need_setup:
+                # Fallback: recreate buffer on first use or if in-place update unsupported
+                self.goal_buffer = self.mpc.setup_solve_single(goal, 1)
+
+            # pick joint vs pose mode
+            self.mpc.enable_pose_cost(enable=True)
+            self.mpc.enable_cspace_cost(enable=True)
+            self.mpc.update_goal(self.goal_buffer)
+
+            self._goal = goal
+            self._update_goal = False
+            self._last_goal_idx = j_idx
+            self._last_goal_s = float(self._s_tgt)
+            # Report progress along the original plan (index within precomputed MG path)
+            #try:
+            #    total_steps = len(self._mg_path['s'])
+            #except Exception:
+            #    total_steps = None
+            #if total_steps is not None and total_steps > 0:
+            #    self.get_logger().info(f'Plan step: {j_idx + 1}/{total_steps} (index {j_idx})')
+            #else:
+            #    self.get_logger().info(f'Plan step index: {j_idx}')
+
+
+            # === MPC step ===
+            mpc_result = self.mpc.step(current_state, max_attempts=2)
+
+            # Update EMA pose error for adaptive look-ahead (simple, robust)
+            pe = float(mpc_result.metrics.pose_error.item())
+            self._ema_pose_err = 0.8 * self._ema_pose_err + 0.2 * pe
+
+            pose_error = pe
             rotation_error = mpc_result.metrics.rotation_error.item()
-            self.get_logger().info(f'MPC pose error: {pose_error}')
-            self.get_logger().info(f'MPC rotation error: {rotation_error}')
+            #self.get_logger().info(f'MPC pose error: {pose_error}')
+            #self.get_logger().info(f'MPC rotation error: {rotation_error}')
 
             cmd_state_full = mpc_result.js_action
             #self.get_logger().info(f'MPC command joint state: {cmd_state_full}')
@@ -566,15 +712,23 @@ class CumotionActionServer(Node):
                     self.get_logger().warn('MPC command joint state contains NaN values')
                     return
 
-                # Create joint trajectory message
+                # Create joint trajectory message (positions-only for smoother controller behavior)
                 joint_trajectory_msg = JointTrajectory()
-                joint_trajectory_msg.joint_names = cmd_state_filtered.joint_names
-                for i in range(len(cmd_state_filtered.position)):
-                    joint_trajectory_msg.points.append(JointTrajectoryPoint(
-                        positions=cmd_state_filtered.position[i],
-                        velocities=cmd_state_filtered.velocity[i],
-                        time_from_start=Duration(seconds=self._mpc_step_dt).to_msg()
-                    ))
+                joint_trajectory_msg.joint_names = list(cmd_state_filtered.joint_names)
+                pt = JointTrajectoryPoint()
+                # ensure CPU numpy
+                pos_np = cmd_state_filtered.position[0].detach().cpu().numpy()
+                # Apply rate limiting and exponential smoothing
+                if self._last_cmd_pos is not None and len(self._last_cmd_pos) == len(pos_np):
+                    delta = pos_np - self._last_cmd_pos
+                    max_step = self._cmd_max_step
+                    if max_step > 0.0:
+                        delta = np.clip(delta, -max_step, max_step)
+                    pos_np = (1.0 - self._cmd_alpha) * self._last_cmd_pos + self._cmd_alpha * (self._last_cmd_pos + delta)
+                self._last_cmd_pos = pos_np
+                pt.positions = pos_np.tolist()
+                pt.time_from_start = Duration(seconds=self._mpc_step_dt).to_msg()
+                joint_trajectory_msg.points.append(pt)
                 self._mpc_cmd_pub.publish(joint_trajectory_msg)
                 # Compute total execution time
                 #total_execution_time = time.time() - now
@@ -704,15 +858,15 @@ class CumotionActionServer(Node):
     def get_joint_trajectory(self, js: CuJointState, dt: float):
         traj = RobotTrajectory()
         cmd_traj = JointTrajectory()
-        q_traj = js.position.cpu().view(-1, js.position.shape[-1]).numpy()
+        q_traj = js.position.cpu().contiguous().view(-1, js.position.shape[-1]).numpy()
 
         vel = None
         if getattr(js, 'velocity', None) is not None:
-            vel = js.velocity.cpu().view(-1, js.position.shape[-1]).numpy()
+            vel = js.velocity.cpu().contiguous().view(-1, js.position.shape[-1]).numpy()
 
         acc = None
         if getattr(js, 'acceleration', None) is not None:
-            acc = js.acceleration.view(-1, js.position.shape[-1]).cpu().numpy()
+            acc = js.acceleration.cpu().contiguous().view(-1, js.position.shape[-1]).numpy()
 
         for i in range(len(q_traj)):
             traj_pt = JointTrajectoryPoint()
@@ -829,7 +983,7 @@ class CumotionActionServer(Node):
             goal_jnames = [jc.joint_name for jc in plan_req.goal_constraints[0].joint_constraints]
             goal_state = self.motion_gen.get_active_js(
                 CuJointState.from_position(
-                    position=self.tensor_args.to_device(goal_config).view(1, -1),
+                    position=self.tensor_args.to_device(goal_config).contiguous().view(1, -1),
                     joint_names=goal_jnames,
                 )
             )
@@ -903,7 +1057,14 @@ class CumotionActionServer(Node):
             if self._use_mpc:
                 self._motion_gen_result = traj
                 self._mpc_active = bool(self._mpc_autorun)
+                # Force recreation of goal buffer for new global trajectory
+                self.goal_buffer = None
                 self._update_goal = True
+                # Reset streaming trackers
+                self._last_goal_idx = -1
+                self._last_goal_s = -1.0
+                self._s_tgt = 0.0
+                self._precompute_mg_path(traj)
                 self.get_logger().info(
                     f'MPC reference loaded: optimized plan={traj}; autorun={self._mpc_active}'
                 )
@@ -948,7 +1109,7 @@ class CumotionActionServer(Node):
         marker.points = []
 
         voxels = voxels[voxels[:, 3] > 0.0]
-        vox = voxels.view(-1, 4).cpu().numpy()
+        vox = voxels.contiguous().view(-1, 4).cpu().numpy()
         n = min(len(vox), self.__max_publish_voxels)
         marker.color.r = 1.0; marker.color.g = 0.0; marker.color.b = 0.0; marker.color.a = 1.0
         for i in range(n):
