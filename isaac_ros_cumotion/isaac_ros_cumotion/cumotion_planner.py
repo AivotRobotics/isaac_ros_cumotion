@@ -650,19 +650,24 @@ class CumotionActionServer(Node):
             except Exception:
                 need_setup = True
 
-            if need_setup:
-                # Fallback: recreate buffer on first use or if in-place update unsupported
-                self.goal_buffer = self.mpc.setup_solve_single(goal, 1)
+            # Ensure buffer is valid and update it atomically
+            with self.lock:
+                if need_setup or (self.goal_buffer is None):
+                    # Fallback: recreate buffer on first use or if in-place update unsupported
+                    self.goal_buffer = self.mpc.setup_solve_single(goal, 1)
 
-            # pick joint vs pose mode
-            self.mpc.enable_pose_cost(enable=True)
-            self.mpc.enable_cspace_cost(enable=True)
-            self.mpc.update_goal(self.goal_buffer)
+                # pick joint vs pose mode
+                self.mpc.enable_pose_cost(enable=True)
+                self.mpc.enable_cspace_cost(enable=True)
+                if self.goal_buffer is not None:
+                    self.mpc.update_goal(self.goal_buffer)
+                else:
+                    self.get_logger().warn('MPC goal_buffer is None; skipping update this tick')
 
-            self._goal = goal
-            self._update_goal = False
-            self._last_goal_idx = j_idx
-            self._last_goal_s = float(self._s_tgt)
+                self._goal = goal
+                self._update_goal = False
+                self._last_goal_idx = j_idx
+                self._last_goal_s = float(self._s_tgt)
             # Report progress along the original plan (index within precomputed MG path)
             #try:
             #    total_steps = len(self._mg_path['s'])
@@ -1055,16 +1060,17 @@ class CumotionActionServer(Node):
 
             # Prepare MPC reference and start tracking (MoveIt execution should be disabled in your launch)
             if self._use_mpc:
-                self._motion_gen_result = traj
-                self._mpc_active = bool(self._mpc_autorun)
-                # Force recreation of goal buffer for new global trajectory
-                self.goal_buffer = None
-                self._update_goal = True
-                # Reset streaming trackers
-                self._last_goal_idx = -1
-                self._last_goal_s = -1.0
-                self._s_tgt = 0.0
-                self._precompute_mg_path(traj)
+                with self.lock:
+                    self._motion_gen_result = traj
+                    self._mpc_active = bool(self._mpc_autorun)
+                    # Force recreation of goal buffer for new global trajectory
+                    self.goal_buffer = None
+                    self._update_goal = True
+                    # Reset streaming trackers
+                    self._last_goal_idx = -1
+                    self._last_goal_s = -1.0
+                    self._s_tgt = 0.0
+                    self._precompute_mg_path(traj)
                 self.get_logger().info(
                     f'MPC reference loaded: optimized plan={traj}; autorun={self._mpc_active}'
                 )
