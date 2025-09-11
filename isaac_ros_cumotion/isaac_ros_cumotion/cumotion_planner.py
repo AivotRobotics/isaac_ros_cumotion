@@ -25,7 +25,7 @@ from curobo.wrap.reacher.motion_gen import (
 from curobo.wrap.reacher.mpc import MpcSolver, MpcSolverConfig
 from curobo.rollout.rollout_base import Goal
 
-from geometry_msgs.msg import Point, Vector3
+from geometry_msgs.msg import Point, Vector3, PoseStamped
 from isaac_ros_cumotion.update_kinematics import get_robot_config, UpdateLinkSpheresServer
 from isaac_ros_cumotion_python_utils.utils import (
     get_grid_center, get_grid_min_corner, get_grid_size, is_grid_valid,
@@ -33,7 +33,7 @@ from isaac_ros_cumotion_python_utils.utils import (
 )
 
 from moveit_msgs.action import MoveGroup
-from moveit_msgs.msg import CollisionObject, MoveItErrorCodes, RobotTrajectory
+from moveit_msgs.msg import CollisionObject, MoveItErrorCodes, RobotTrajectory, RobotState, DisplayTrajectory
 
 from nvblox_msgs.srv import EsdfAndGradients
 from rclpy.action import ActionServer
@@ -129,6 +129,8 @@ class CumotionActionServer(Node):
         self._mpc_lookahead_m = self.get_parameter('mpc_lookahead_m').get_parameter_value().double_value
         self._mpc_min_lookahead_voxels = self.get_parameter('mpc_min_lookahead_voxels').get_parameter_value().integer_value
         self._goal = None
+        # Direct single-pose goal (bypass MotionGen path streaming)
+        self._direct_goal_pose = None
 
         # Forward-only progress tracking ---
         self._la_last_idx = 0        # last index we accepted (monotonic)
@@ -259,11 +261,18 @@ class CumotionActionServer(Node):
         )
         self.__js_buffer = None
 
+        # Fast-topic pose goal (optional): publish PoseStamped to switch target without action
+        self._pose_goal_sub = self.create_subscription(
+            PoseStamped, 'cumotion/goal_pose', self.pose_goal_callback, 10
+        )
+
         # Viz timer
         self.timer = self.create_timer(self._mpc_step_dt/2, self.viz_timer)
 
         # MPC publisher & timer
         self._mpc_cmd_pub = self.create_publisher(JointTrajectory, self._mpc_cmd_topic, 10)
+        # Publisher to the standard MoveIt display topic used by RViz
+        self._display_traj_pub = self.create_publisher(DisplayTrajectory, '/display_planned_path', 10)
         if self._use_mpc:
             self.load_mpc()
             self._mpc_timer = self.create_timer(self._mpc_step_dt, self.mpc_tick)
@@ -372,6 +381,45 @@ class CumotionActionServer(Node):
 
     def js_callback(self, msg):
         self.__js_buffer = {'joint_names': msg.name, 'position': msg.position, 'velocity': msg.velocity}
+
+    def pose_goal_callback(self, msg: PoseStamped):
+        """Accept a PoseStamped target and feed it directly to MPC as a final goal.
+        This bypasses global MotionGen planning and simply commands the controller
+        to move towards the desired pose (even if unreachable).
+        """
+        try:
+            if self.__js_buffer is None:
+                self.get_logger().error('pose_goal: no JointState received yet; ignoring goal')
+                return
+
+            # Optionally refresh ESDF
+            if self.__read_esdf_grid:
+                try:
+                    self.update_voxel_grid()
+                except Exception as e:
+                    self.get_logger().warn(f'pose_goal: ESDF update failed: {e}')
+
+            # Build goal pose
+            p = msg.pose.position
+            q = msg.pose.orientation
+            goal_pose = Pose.from_list([p.x, p.y, p.z, q.w, q.x, q.y, q.z], tensor_args=self.tensor_args)
+
+            # Store as a direct goal for MPC and activate tracking
+            with self.lock:
+                self._direct_goal_pose = goal_pose
+                self._motion_gen_result = None  # disable MG path tracking
+                self._mg_path = None
+                self.goal_buffer = None  # ensure fresh goal buffer on next tick
+                self._update_goal = True
+                self._last_goal_idx = -1
+                self._last_goal_s = -1.0
+                self._s_tgt = 0.0
+                self._endgame = False
+                self._mpc_active = bool(self._mpc_autorun) and self._use_mpc
+
+            self.get_logger().info('pose_goal: set direct MPC goal (autorun=%s)' % self._mpc_active)
+        except Exception as e:
+            self.get_logger().error(f'pose_goal: exception: {e}')
 
     def load_motion_gen(self):
         tensor_args = self.tensor_args
@@ -561,7 +609,7 @@ class CumotionActionServer(Node):
         current_state = self.mpc.get_active_js(state)
         #self.get_logger().info(f'Current state: {current_state}')
 
-        # Compute look-ahead goal from MG path
+        # Compute/update goal for MPC
         if self._motion_gen_result is not None:
             if self._mg_path is None:
                 try:
@@ -738,6 +786,96 @@ class CumotionActionServer(Node):
                 # Compute total execution time
                 #total_execution_time = time.time() - now
                 #self.get_logger().info(f'Total execution time: {total_execution_time:.4f} seconds')
+
+        elif self._direct_goal_pose is not None:
+            # Pose-only goal: push the single desired EE pose to MPC and step
+            try:
+                # Build goal using current state and the stored target pose
+                retract = current_state.position
+                if retract.ndim == 1:
+                    retract = retract.unsqueeze(0)
+                retract = retract.detach().clone().to(self.mpc.tensor_args.device)
+
+                goal = Goal(
+                    current_state=current_state,
+                    goal_pose=self._direct_goal_pose,
+                    retract_state=retract,
+                )
+
+                # Refresh or update goal buffer
+                need_setup = (self.goal_buffer is None) or self._update_goal
+                if need_setup:
+                    with self.lock:
+                        self.goal_buffer = self.mpc.setup_solve_single(goal, 1)
+                        # Pose-only tracking
+                        self.mpc.enable_pose_cost(enable=True)
+                        self.mpc.enable_cspace_cost(enable=False)
+                        if self.goal_buffer is not None:
+                            self.mpc.update_goal(self.goal_buffer)
+                        self._goal = goal
+                        self._update_goal = False
+                else:
+                    # Update in-place when possible
+                    try:
+                        if hasattr(self.goal_buffer, 'goal_pose'):
+                            self.goal_buffer.goal_pose = self._direct_goal_pose
+                        elif isinstance(self.goal_buffer, dict) and 'goal_pose' in self.goal_buffer:
+                            self.goal_buffer['goal_pose'] = self._direct_goal_pose
+                    except Exception:
+                        pass
+                    with self.lock:
+                        self.mpc.enable_pose_cost(enable=True)
+                        self.mpc.enable_cspace_cost(enable=False)
+                        if self.goal_buffer is not None:
+                            self.mpc.update_goal(self.goal_buffer)
+                        self._goal = goal
+                        self._update_goal = False
+
+                # === MPC step ===
+                mpc_result = self.mpc.step(current_state, max_attempts=2)
+
+                # Update EMA pose error (for diagnostics/consistency)
+                pe = float(mpc_result.metrics.pose_error.item())
+                self._ema_pose_err = 0.8 * self._ema_pose_err + 0.2 * pe
+
+                cmd_state_full = mpc_result.js_action
+
+                # Filter out any invalid joint states comparing with current_state
+                valid_positions = []
+                valid_names = []
+                for i, name in enumerate(cmd_state_full.joint_names):
+                    if name in current_state.joint_names:
+                        valid_names.append(name)
+                        valid_positions.append(cmd_state_full.position[0, i])
+
+                cmd_state_filtered = CuJointState.from_position(
+                    position=torch.stack(valid_positions, dim=0).unsqueeze(0),
+                    joint_names=valid_names
+                )
+
+                # Publish command state to joint controller
+                if cmd_state_filtered is not None:
+                    if torch.isnan(cmd_state_filtered.position).any():
+                        self.get_logger().warn('MPC command joint state contains NaN values')
+                        return
+                    jt = JointTrajectory()
+                    jt.joint_names = list(cmd_state_filtered.joint_names)
+                    pt = JointTrajectoryPoint()
+                    pos_np = cmd_state_filtered.position[0].detach().cpu().numpy()
+                    # Apply rate limiting and exponential smoothing
+                    if self._last_cmd_pos is not None and len(self._last_cmd_pos) == len(pos_np):
+                        delta = pos_np - self._last_cmd_pos
+                        max_step = self._cmd_max_step
+                        if max_step > 0.0:
+                            delta = np.clip(delta, -max_step, max_step)
+                        pos_np = (1.0 - self._cmd_alpha) * self._last_cmd_pos + self._cmd_alpha * (self._last_cmd_pos + delta)
+                    self._last_cmd_pos = pos_np
+                    pt.positions = pos_np.tolist()
+                    pt.time_from_start = Duration(seconds=self._mpc_step_dt).to_msg()
+                    jt.points.append(pt)
+                    self._mpc_cmd_pub.publish(jt)
+            except Exception as e:
+                self.get_logger().warn(f'Direct-goal MPC tick failed: {e}')
 
 
         # ------------------- ESDF / World -------------------
