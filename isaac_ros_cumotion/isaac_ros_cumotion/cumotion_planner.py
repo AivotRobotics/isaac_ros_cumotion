@@ -46,6 +46,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from visualization_msgs.msg import Marker
 
 from rclpy.duration import Duration
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType, ParameterValue
 
 
 class CumotionActionServer(Node):
@@ -87,6 +88,11 @@ class CumotionActionServer(Node):
         # Debug / scaling overrides
         self.declare_parameter('override_moveit_scaling_factors', False)
         self.declare_parameter('update_link_sphere_server', 'planner_attach_object')
+        self.declare_parameter(
+            'excluded_joint_names',
+            ParameterValue(type=ParameterType.PARAMETER_STRING_ARRAY, string_array_value=[]),
+            descriptor=ParameterDescriptor(type=ParameterType.PARAMETER_STRING_ARRAY)
+        )
 
         # MPPI rollout viz
         self.declare_parameter('viz_enable_mppi_rollouts', True)
@@ -100,7 +106,7 @@ class CumotionActionServer(Node):
         # === MPC params ===
         self.declare_parameter('use_mpc', True)
         self.declare_parameter('mpc_autorun', True)
-        self.declare_parameter('mpc_step_dt', 0.03) # 0.03 for pose control
+        self.declare_parameter('mpc_step_dt', 0.05) # 0.03 for pose control
         self.declare_parameter('mpc_cmd_topic', '/ur_arm_controller/joint_trajectory')  # change if your controller differs
         self.declare_parameter('mpc_world_update_period', 0.15)
         # Optional command smoothing to reduce jerkiness
@@ -171,6 +177,9 @@ class CumotionActionServer(Node):
         self.__override_moveit_scaling_factors = (
             self.get_parameter('override_moveit_scaling_factors').get_parameter_value().bool_value
         )
+
+        excluded_param = self.get_parameter('excluded_joint_names').get_parameter_value().string_array_value
+        self._excluded_joint_names = set(excluded_param) if excluded_param else set()
 
         # Motion generation parameters
         self.__max_attempts = self.get_parameter('max_attempts').get_parameter_value().integer_value
@@ -743,17 +752,24 @@ class CumotionActionServer(Node):
             #self.get_logger().info(f'MPC command joint state: {cmd_state_full}')
 
             # Filter out any invalid joint states comparing with current_state
+            current_joint_name_set = set(current_state.joint_names)
             valid_positions = []
             valid_names = []
             for i, name in enumerate(cmd_state_full.joint_names):
-                if name in current_state.joint_names:
+                if name in current_joint_name_set and name not in self._excluded_joint_names:
                     valid_names.append(name)
                     valid_positions.append(cmd_state_full.position[0, i])
 
-            cmd_state_filtered = CuJointState.from_position(
-                position=torch.stack(valid_positions, dim=0).unsqueeze(0),
-                joint_names=valid_names
-            )
+            if valid_positions:
+                cmd_state_filtered = CuJointState.from_position(
+                    position=torch.stack(valid_positions, dim=0).unsqueeze(0),
+                    joint_names=valid_names
+                )
+            else:
+                cmd_state_filtered = None
+                self._last_cmd_pos = None
+                if self._excluded_joint_names:
+                    self.get_logger().warn('MPC command dropped after applying excluded_joint_names filter')
 
             #self.get_logger().info(f'MPC command filtered joint state: {cmd_state_filtered}')
             #self.get_logger().info(f'MPC result: {mpc_result}')
@@ -841,17 +857,24 @@ class CumotionActionServer(Node):
                 cmd_state_full = mpc_result.js_action
 
                 # Filter out any invalid joint states comparing with current_state
+                current_joint_name_set = set(current_state.joint_names)
                 valid_positions = []
                 valid_names = []
                 for i, name in enumerate(cmd_state_full.joint_names):
-                    if name in current_state.joint_names:
+                    if name in current_joint_name_set and name not in self._excluded_joint_names:
                         valid_names.append(name)
                         valid_positions.append(cmd_state_full.position[0, i])
 
-                cmd_state_filtered = CuJointState.from_position(
-                    position=torch.stack(valid_positions, dim=0).unsqueeze(0),
-                    joint_names=valid_names
-                )
+                if valid_positions:
+                    cmd_state_filtered = CuJointState.from_position(
+                        position=torch.stack(valid_positions, dim=0).unsqueeze(0),
+                        joint_names=valid_names
+                    )
+                else:
+                    cmd_state_filtered = None
+                    self._last_cmd_pos = None
+                    if self._excluded_joint_names:
+                        self.get_logger().warn('MPC command dropped after applying excluded_joint_names filter')
 
                 # Publish command state to joint controller
                 if cmd_state_filtered is not None:
