@@ -754,17 +754,23 @@ class CumotionActionServer(Node):
             # Filter out any invalid joint states comparing with current_state
             current_joint_name_set = set(current_state.joint_names)
             valid_positions = []
+            valid_velocities = []
             valid_names = []
+            has_velocity = getattr(cmd_state_full, 'velocity', None) is not None
             for i, name in enumerate(cmd_state_full.joint_names):
                 if name in current_joint_name_set and name not in self._excluded_joint_names:
                     valid_names.append(name)
                     valid_positions.append(cmd_state_full.position[0, i])
+                    if has_velocity:
+                        valid_velocities.append(cmd_state_full.velocity[0, i])
 
             if valid_positions:
                 cmd_state_filtered = CuJointState.from_position(
                     position=torch.stack(valid_positions, dim=0).unsqueeze(0),
                     joint_names=valid_names
                 )
+                if has_velocity and valid_velocities:
+                    cmd_state_filtered.velocity = torch.stack(valid_velocities, dim=0).unsqueeze(0)
             else:
                 cmd_state_filtered = None
                 self._last_cmd_pos = None
@@ -781,7 +787,7 @@ class CumotionActionServer(Node):
                     self.get_logger().warn('MPC command joint state contains NaN values')
                     return
 
-                # Create joint trajectory message (positions-only for smoother controller behavior)
+                # Create joint trajectory message with position + velocity targets
                 joint_trajectory_msg = JointTrajectory()
                 joint_trajectory_msg.joint_names = list(cmd_state_filtered.joint_names)
                 pt = JointTrajectoryPoint()
@@ -796,6 +802,9 @@ class CumotionActionServer(Node):
                     pos_np = (1.0 - self._cmd_alpha) * self._last_cmd_pos + self._cmd_alpha * (self._last_cmd_pos + delta)
                 self._last_cmd_pos = pos_np
                 pt.positions = pos_np.tolist()
+                vel_tensor = getattr(cmd_state_filtered, 'velocity', None)
+                if vel_tensor is not None:
+                    pt.velocities = vel_tensor[0].detach().cpu().numpy().tolist()
                 pt.time_from_start = Duration(seconds=self._mpc_step_dt).to_msg()
                 joint_trajectory_msg.points.append(pt)
                 self._mpc_cmd_pub.publish(joint_trajectory_msg)
@@ -859,17 +868,23 @@ class CumotionActionServer(Node):
                 # Filter out any invalid joint states comparing with current_state
                 current_joint_name_set = set(current_state.joint_names)
                 valid_positions = []
+                valid_velocities = []
                 valid_names = []
+                has_velocity = getattr(cmd_state_full, 'velocity', None) is not None
                 for i, name in enumerate(cmd_state_full.joint_names):
                     if name in current_joint_name_set and name not in self._excluded_joint_names:
                         valid_names.append(name)
                         valid_positions.append(cmd_state_full.position[0, i])
+                        if has_velocity:
+                            valid_velocities.append(cmd_state_full.velocity[0, i])
 
                 if valid_positions:
                     cmd_state_filtered = CuJointState.from_position(
                         position=torch.stack(valid_positions, dim=0).unsqueeze(0),
                         joint_names=valid_names
                     )
+                    if has_velocity and valid_velocities:
+                        cmd_state_filtered.velocity = torch.stack(valid_velocities, dim=0).unsqueeze(0)
                 else:
                     cmd_state_filtered = None
                     self._last_cmd_pos = None
@@ -894,6 +909,9 @@ class CumotionActionServer(Node):
                         pos_np = (1.0 - self._cmd_alpha) * self._last_cmd_pos + self._cmd_alpha * (self._last_cmd_pos + delta)
                     self._last_cmd_pos = pos_np
                     pt.positions = pos_np.tolist()
+                    vel_tensor = getattr(cmd_state_filtered, 'velocity', None)
+                    if vel_tensor is not None:
+                        pt.velocities = vel_tensor[0].detach().cpu().numpy().tolist()
                     pt.time_from_start = Duration(seconds=self._mpc_step_dt).to_msg()
                     jt.points.append(pt)
                     self._mpc_cmd_pub.publish(jt)
