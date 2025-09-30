@@ -5,6 +5,7 @@ from copy import deepcopy
 from os import path
 import threading
 import time
+from typing import Optional
 import numpy as np
 import torch
 import rclpy
@@ -37,9 +38,10 @@ from moveit_msgs.msg import CollisionObject, MoveItErrorCodes, RobotTrajectory, 
 
 from nvblox_msgs.srv import EsdfAndGradients
 from rclpy.action import ActionServer
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.task import Future
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -151,6 +153,15 @@ class CumotionActionServer(Node):
         self.__voxel_pub = self.create_publisher(Marker, '/curobo/voxels', 10)
         self.planner_busy = False
         self.lock = threading.Lock()
+        self._esdf_lock = threading.Lock()
+        self._esdf_future: Optional[Future] = None
+        self._esdf_request_in_progress = False
+        self._esdf_last_request_ts = 0.0
+        self._esdf_last_success_ts = 0.0
+        self._esdf_update_success = False
+        self._esdf_timer = None
+        self._esdf_timer_group = None
+        self._pending_esdf_grid: Optional[CuVoxelGrid] = None
 
         self.__robot_file = self.get_parameter('robot').get_parameter_value().string_value
 
@@ -257,6 +268,12 @@ class CumotionActionServer(Node):
         self._mpc_step_dt = self.get_parameter('mpc_step_dt').get_parameter_value().double_value
         self._mpc_cmd_topic = self.get_parameter('mpc_cmd_topic').get_parameter_value().string_value
         self._mpc_world_update_period = self.get_parameter('mpc_world_update_period').get_parameter_value().double_value
+
+        if self.__read_esdf_grid:
+            period = max(self._mpc_world_update_period, 0.05)
+            self._esdf_timer_group = ReentrantCallbackGroup()
+            self._esdf_timer = self.create_timer(period, self._esdf_timer_callback, callback_group=self._esdf_timer_group)
+            self._queue_esdf_request(force=True)
 
         self._mpc_active = False
         self._update_goal = False
@@ -404,7 +421,7 @@ class CumotionActionServer(Node):
             # Optionally refresh ESDF
             if self.__read_esdf_grid:
                 try:
-                    self.update_voxel_grid()
+                    self.update_voxel_grid(force=True)
                 except Exception as e:
                     self.get_logger().warn(f'pose_goal: ESDF update failed: {e}')
 
@@ -602,11 +619,8 @@ class CumotionActionServer(Node):
                 )
 
         now = time.time()
-        if self.__read_esdf_grid and (now - self._last_world_update_ts) >= self._mpc_world_update_period:
-            # World/ESDF update for local planning
-            world_objects = []
-            if self.update_world_objects(world_objects):
-                self._last_world_update_ts = now
+        if self.__read_esdf_grid:
+            self._apply_pending_esdf_grid()
 
         # Current measured state from joint_states callback
         state = CuJointState.from_position(
@@ -809,8 +823,8 @@ class CumotionActionServer(Node):
                 joint_trajectory_msg.points.append(pt)
                 self._mpc_cmd_pub.publish(joint_trajectory_msg)
                 # Compute total execution time
-                #total_execution_time = time.time() - now
-                #self.get_logger().info(f'Total execution time: {total_execution_time:.4f} seconds')
+                total_execution_time = time.time() - now
+                self.get_logger().info(f'Total execution time: {total_execution_time:.4f} seconds')
 
         elif self._direct_goal_pose is not None:
             # Pose-only goal: push the single desired EE pose to MPC and step
@@ -921,29 +935,112 @@ class CumotionActionServer(Node):
 
         # ------------------- ESDF / World -------------------
 
-    def update_voxel_grid(self):
-        self.get_logger().info('Calling ESDF service')
+    def _esdf_timer_callback(self):
+        self._queue_esdf_request()
+
+    def _queue_esdf_request(self, force: bool = False):
+        if not self.__read_esdf_grid or self.__esdf_client is None:
+            return
+
+        now = time.time()
+        with self._esdf_lock:
+            if self._esdf_request_in_progress:
+                return
+            if not force and (now - self._esdf_last_request_ts) < self._mpc_world_update_period:
+                return
+            self._esdf_request_in_progress = True
+            self._esdf_last_request_ts = now
+            self._esdf_update_success = False
+
         min_corner = get_grid_min_corner(self.__grid_center_m, self.__grid_size_m)
         aabb_min = Point(x=min_corner[0], y=min_corner[1], z=min_corner[2])
         aabb_size = Vector3(x=self.__grid_size_m[0], y=self.__grid_size_m[1], z=self.__grid_size_m[2])
-        esdf_future = self.send_request(aabb_min, aabb_size)
-        while not esdf_future.done():
-            time.sleep(0.001)
-        response = esdf_future.result()
+        self.get_logger().info('Dispatching ESDF service request')
+        try:
+            future = self.send_request(aabb_min, aabb_size)
+        except Exception as e:
+            with self._esdf_lock:
+                self._esdf_request_in_progress = False
+                self._esdf_future = None
+            self.get_logger().warn(f'Failed to dispatch ESDF request: {e}')
+            return
+
+        with self._esdf_lock:
+            self._esdf_future = future
+        future.add_done_callback(self._on_esdf_response)
+
+    def _on_esdf_response(self, future: Future):
+        try:
+            response = future.result()
+        except Exception as e:
+            self.get_logger().warn(f'ESDF request exception: {e}')
+            success = False
+        else:
+            success = self._handle_esdf_response(response)
+
+        with self._esdf_lock:
+            self._esdf_request_in_progress = False
+            self._esdf_future = None
+            if success:
+                self._esdf_last_success_ts = time.time()
+                self._esdf_update_success = True
+            else:
+                self._esdf_update_success = False
+
+        if success:
+            self._last_world_update_ts = time.time()
+
+    def update_voxel_grid(self, force: bool = False):
+        if not self.__read_esdf_grid:
+            return False
+        self._queue_esdf_request(force=force)
+
+        if force:
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if self._apply_pending_esdf_grid():
+                    return True
+                time.sleep(0.002)
+            self.get_logger().warn('ESDF update timed out waiting for response')
+            return False
+
+        applied = self._apply_pending_esdf_grid()
+        if applied:
+            return True
+        with self._esdf_lock:
+            return self._esdf_update_success
+
+    def _apply_pending_esdf_grid(self) -> bool:
+        with self._esdf_lock:
+            grid = self._pending_esdf_grid
+            if grid is None:
+                return False
+            self._pending_esdf_grid = None
+
+        with self.lock:
+            self.__world_collision.update_voxel_data(grid)
+            if hasattr(self, 'mpc') and self.mpc is not None:
+                try:
+                    self.mpc.world_collision.update_voxel_data(grid)
+                except Exception as e:
+                    self.get_logger().warn(f'Failed to update MPC voxel grid: {e}')
+
+        self.get_logger().info('Updated ESDF grid')
+        return True
+
+    def _handle_esdf_response(self, response) -> bool:
         if not response.success:
             self.get_logger().info('ESDF request failed, try again after few seconds.')
             return False
+
         esdf_grid = self.get_esdf_voxel_grid(response)
         if torch.max(esdf_grid.feature_tensor) <= (-1000.0 + 0.5 * self.__voxel_size + 1e-5):
             self.get_logger().error('ESDF data is empty, try again after few seconds.')
             return False
-        self.__world_collision.update_voxel_data(esdf_grid)
-        if hasattr(self, 'mpc') and self.mpc is not None:
-            try:
-                self.mpc.world_collision.update_voxel_data(esdf_grid)
-            except Exception as e:
-                self.get_logger().warn(f'Failed to update MPC voxel grid: {e}')
-        self.get_logger().info('Updated ESDF grid')
+
+        with self._esdf_lock:
+            self._pending_esdf_grid = esdf_grid
+
         return True
 
     def send_request(self, aabb_min_m, aabb_size_m):
@@ -1088,7 +1185,7 @@ class CumotionActionServer(Node):
                 except Exception as e:
                     self.get_logger().warn(f'Failed to update MPC world (meshes/primitives): {e}')
         if self.__read_esdf_grid:
-            world_update_status = self.update_voxel_grid()
+            world_update_status = self.update_voxel_grid(force=True)
         if self.__publish_curobo_world_as_voxels and self.__voxel_pub.get_subscription_count() > 0:
             voxels = self.__world_collision.get_occupancy_in_bounding_box(
                 Cuboid(name='test', pose=[0.0, 0.0, 0.0, 1, 0, 0, 0], dims=self.__grid_size_m),
