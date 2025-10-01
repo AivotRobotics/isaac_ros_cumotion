@@ -119,7 +119,6 @@ class CumotionActionServer(Node):
         self.declare_parameter('mpc_stall_jump_points', 3)     # points to jump ahead when stalled
         self._mg_path = None     # dict with EE xyz [N,3], s [N], q_mpc [N,DoF], names, etc.
         self._ema_pose_err = 0.0 # for adaptive look-ahead
-        self._endgame = False
         self._cmd_alpha = float(self.get_parameter('mpc_cmd_smoothing_alpha').get_parameter_value().double_value)
         self._cmd_max_step = float(self.get_parameter('mpc_cmd_max_step').get_parameter_value().double_value)
         self._last_cmd_pos = None
@@ -346,7 +345,6 @@ class CumotionActionServer(Node):
         }
         self._la_last_idx = 0
         self._s_progress = 0.0
-        self._endgame = False # reset on new path
         self._last_cmd_pos = None
 
     def _publish_mppi_rollouts(self):
@@ -440,7 +438,6 @@ class CumotionActionServer(Node):
                 self._last_goal_idx = -1
                 self._last_goal_s = -1.0
                 self._s_tgt = 0.0
-                self._endgame = False
                 self._mpc_active = bool(self._mpc_autorun) and self._use_mpc
 
             self.get_logger().info('pose_goal: set direct MPC goal (autorun=%s)' % self._mpc_active)
@@ -618,7 +615,6 @@ class CumotionActionServer(Node):
                     f'controller may be on a different topic.'
                 )
 
-        now = time.time()
         if self.__read_esdf_grid:
             self._apply_pending_esdf_grid()
 
@@ -646,22 +642,14 @@ class CumotionActionServer(Node):
                         .detach().cpu().numpy().reshape(3)
 
             j_idx = self._pick_lookahead_index(ee_cur)
-
-            # endgame freeze: once we hit the final waypoint, keep it there
             N = len(self._mg_path['s'])
-            if j_idx == N - 1:
-                self._endgame = True
-                self.get_logger().info('MPC in endgame mode (final waypoint reached).')
-
-            if self._endgame:
-                j_idx = N - 1
 
             # If we haven't advanced index for a while, force a jump forward
             if j_idx <= self._last_goal_idx:
                 self._stall_counter += 1
             else:
                 self._stall_counter = 0
-            if self._stall_counter >= self._stall_ticks_thresh and not self._endgame:
+            if self._stall_counter >= self._stall_ticks_thresh:
                 forced_idx = min(N - 1, self._last_goal_idx + self._stall_jump_pts)
                 if forced_idx > j_idx:
                     j_idx = forced_idx
