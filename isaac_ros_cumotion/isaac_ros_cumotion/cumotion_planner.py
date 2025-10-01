@@ -601,6 +601,9 @@ class CumotionActionServer(Node):
         return j
 
     def mpc_tick(self):
+        now = time.time()
+        if self.__read_esdf_grid:
+            self._apply_pending_esdf_grid()
 
         if not self._mpc_active or self.__js_buffer is None:
             return
@@ -614,9 +617,6 @@ class CumotionActionServer(Node):
                     f'MPC cmd topic "{self._mpc_cmd_topic}" has {subs} subscribers; '
                     f'controller may be on a different topic.'
                 )
-
-        if self.__read_esdf_grid:
-            self._apply_pending_esdf_grid()
 
         # Current measured state from joint_states callback
         state = CuJointState.from_position(
@@ -1014,6 +1014,18 @@ class CumotionActionServer(Node):
                     self.get_logger().warn(f'Failed to update MPC voxel grid: {e}')
 
         self.get_logger().info('Updated ESDF grid')
+        self.get_logger().info('Updated ESDF grid')
+        if self.__publish_curobo_world_as_voxels and self.__voxel_pub.get_subscription_count() > 0:
+            try:
+                voxels = self.__world_collision.get_occupancy_in_bounding_box(
+                    Cuboid(name='mpc_world', pose=[0.0, 0.0, 0.0, 1, 0, 0, 0], dims=self.__grid_size_m),
+                    voxel_size=self.__publish_voxel_size,
+                )
+                xyzr_tensor = voxels.xyzr_tensor.clone()
+                xyzr_tensor[..., 3] = voxels.feature_tensor
+                self.publish_voxels(xyzr_tensor)
+            except Exception as e:
+                self.get_logger().warn(f'Failed to publish updated voxels: {e}')
         return True
 
     def _handle_esdf_response(self, response) -> bool:
