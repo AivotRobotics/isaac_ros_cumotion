@@ -527,7 +527,7 @@ class CumotionActionServer(Node):
             use_cuda_graph_metrics=True,
             use_cuda_graph_full_step=False,
             self_collision_check=True,
-            collision_activation_distance=0.05,
+            collision_activation_distance=0.1,
             compute_metrics=True
         )
 
@@ -943,7 +943,7 @@ class CumotionActionServer(Node):
         min_corner = get_grid_min_corner(self.__grid_center_m, self.__grid_size_m)
         aabb_min = Point(x=min_corner[0], y=min_corner[1], z=min_corner[2])
         aabb_size = Vector3(x=self.__grid_size_m[0], y=self.__grid_size_m[1], z=self.__grid_size_m[2])
-        self.get_logger().info('Dispatching ESDF service request')
+       # self.get_logger().info('Dispatching ESDF service request')
         try:
             future = self.send_request(aabb_min, aabb_size)
         except Exception as e:
@@ -1013,8 +1013,7 @@ class CumotionActionServer(Node):
                 except Exception as e:
                     self.get_logger().warn(f'Failed to update MPC voxel grid: {e}')
 
-        self.get_logger().info('Updated ESDF grid')
-        self.get_logger().info('Updated ESDF grid')
+        #self.get_logger().info('Updated ESDF grid')
         if self.__publish_curobo_world_as_voxels and self.__voxel_pub.get_subscription_count() > 0:
             try:
                 voxels = self.__world_collision.get_occupancy_in_bounding_box(
@@ -1050,7 +1049,7 @@ class CumotionActionServer(Node):
         self.__esdf_req.frame_id = self.__robot_base_frame
         self.__esdf_req.aabb_min_m = aabb_min_m
         self.__esdf_req.aabb_size_m = aabb_size_m
-        self.get_logger().info(f'ESDF  req = {self.__esdf_req.aabb_min_m}, {self.__esdf_req.aabb_size_m}')
+        #self.get_logger().info(f'ESDF  req = {self.__esdf_req.aabb_min_m}, {self.__esdf_req.aabb_size_m}')
         return self.__esdf_client.call_async(self.__esdf_req)
 
     def get_esdf_voxel_grid(self, esdf_data):
