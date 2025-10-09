@@ -27,6 +27,7 @@ from curobo.wrap.reacher.mpc import MpcSolver, MpcSolverConfig
 from curobo.rollout.rollout_base import Goal
 
 from geometry_msgs.msg import Point, Vector3, PoseStamped
+from std_msgs.msg import String
 from isaac_ros_cumotion.update_kinematics import get_robot_config, UpdateLinkSpheresServer
 from isaac_ros_cumotion_python_utils.utils import (
     get_grid_center, get_grid_min_corner, get_grid_size, is_grid_valid,
@@ -103,10 +104,17 @@ class CumotionActionServer(Node):
         self._viz_rollouts_topic = self.get_parameter('viz_rollouts_topic').get_parameter_value().string_value
         self._viz_rollouts_pub = self.create_publisher(Marker, self._viz_rollouts_topic, 10)
 
+        self._esdf_change_threshold = float(
+            self.declare_parameter('esdf_change_threshold', 0.03).get_parameter_value().double_value
+        )
+        self._esdf_change_pub = self.create_publisher(String, 'cumotion/esdf_change', 1)
+        self._replan_needed_pub = self.create_publisher(String, 'cumotion/replan_needed', 1)
+        self._prev_esdf_tensor = None
+
 
 
         # === MPC params ===
-        self.declare_parameter('use_mpc', True)
+        self.declare_parameter('use_mpc', False)
         self.declare_parameter('mpc_autorun', True)
         self.declare_parameter('mpc_step_dt', 0.05) # 0.03 for pose control
         self.declare_parameter('mpc_cmd_topic', '/ur_arm_controller/joint_trajectory')  # change if your controller differs
@@ -277,6 +285,7 @@ class CumotionActionServer(Node):
         self._mpc_active = False
         self._update_goal = False
         self._motion_gen_result = None
+        self._last_planned_traj: Optional[RobotTrajectory] = None
         self._last_world_update_ts = 0.0
         self.goal_buffer = None
 
@@ -346,6 +355,43 @@ class CumotionActionServer(Node):
         self._la_last_idx = 0
         self._s_progress = 0.0
         self._last_cmd_pos = None
+
+    def _trajectory_has_world_collision(self, traj: Optional[RobotTrajectory]) -> bool:
+        """Return True if any waypoint in the stored trajectory collides in the current ESDF."""
+        if traj is None or traj.joint_trajectory is None:
+            return False
+        jt = traj.joint_trajectory
+        if len(jt.points) == 0:
+            return False
+
+        moveit_jn = list(jt.joint_names)
+        try:
+            mg_jn = list(self.motion_gen.rollout_fn.joint_names)
+        except AttributeError:
+            self.get_logger().warn('MotionGen rollout joint names unavailable for collision check.')
+            return False
+
+        try:
+            idx = [moveit_jn.index(name) for name in mg_jn]
+        except ValueError as exc:
+            self.get_logger().warn(f'Joint name mismatch during collision check: {exc}')
+            return False
+
+        tensor_args = self.motion_gen.tensor_args
+        for point in jt.points:
+            reordered = [point.positions[i] for i in idx]
+            js = CuJointState.from_position(
+                position=tensor_args.to_device(reordered),
+                joint_names=mg_jn,
+            )
+            try:
+                valid, status = self.motion_gen.check_start_state(js)
+            except ValueError as exc:
+                self.get_logger().warn(f'Collision check exception for stored trajectory: {exc}')
+                return True
+            if not valid and status == MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION:
+                return True
+        return False
 
     def _publish_mppi_rollouts(self):
         if not self._viz_enable_mppi_rollouts or self._viz_rollouts_pub.get_subscription_count() < 1:
@@ -925,6 +971,7 @@ class CumotionActionServer(Node):
 
     def _esdf_timer_callback(self):
         self._queue_esdf_request()
+        self._apply_pending_esdf_grid()
 
     def _queue_esdf_request(self, force: bool = False):
         if not self.__read_esdf_grid or self.__esdf_client is None:
@@ -1005,6 +1052,32 @@ class CumotionActionServer(Node):
                 return False
             self._pending_esdf_grid = None
 
+        esdf_changed = False
+        try:
+            new_tensor = grid.feature_tensor.detach().clone()
+        except Exception as exc:
+            self.get_logger().warn(f'ESDF change tensor copy failed: {exc}')
+            new_tensor = None
+
+        if self._esdf_change_threshold > 0.0 and new_tensor is not None:
+            try:
+                if self._prev_esdf_tensor is not None:
+                    if self._prev_esdf_tensor.shape == new_tensor.shape:
+                        diff = torch.abs(new_tensor - self._prev_esdf_tensor)
+                        esdf_changed = bool(torch.any(diff > self._esdf_change_threshold).item())
+                    else:
+                        esdf_changed = True
+            except Exception as exc:
+                self.get_logger().warn(f'ESDF change detection failed: {exc}')
+                esdf_changed = True
+
+        if new_tensor is not None:
+            self._prev_esdf_tensor = new_tensor
+
+        if esdf_changed and self._esdf_change_pub.get_subscription_count() > 0:
+            msg = String()
+            msg.data = 'changed'
+            self._esdf_change_pub.publish(msg)
         with self.lock:
             self.__world_collision.update_voxel_data(grid)
             if hasattr(self, 'mpc') and self.mpc is not None:
@@ -1012,6 +1085,13 @@ class CumotionActionServer(Node):
                     self.mpc.world_collision.update_voxel_data(grid)
                 except Exception as e:
                     self.get_logger().warn(f'Failed to update MPC voxel grid: {e}')
+
+        if esdf_changed and (not self._use_mpc) and self._last_planned_traj is not None:
+            if self._trajectory_has_world_collision(self._last_planned_traj):
+                replan_msg = String()
+                replan_msg.data = 'replan_needed'
+                self._replan_needed_pub.publish(replan_msg)
+                self.get_logger().warn('Stored trajectory collides with updated ESDF. Replan required.')
 
         #self.get_logger().info('Updated ESDF grid')
         if self.__publish_curobo_world_as_voxels and self.__voxel_pub.get_subscription_count() > 0:
@@ -1330,6 +1410,7 @@ class CumotionActionServer(Node):
 
             result.planned_trajectory = traj
             result.planning_time = float(motion_gen_result.total_time)
+            self._last_planned_traj = traj
 
             goal_handle.succeed()
 
