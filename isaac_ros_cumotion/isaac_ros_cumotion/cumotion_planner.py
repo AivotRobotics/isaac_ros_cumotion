@@ -34,11 +34,11 @@ from isaac_ros_cumotion_python_utils.utils import (
     load_grid_corners_from_workspace_file
 )
 
-from moveit_msgs.action import MoveGroup
+from moveit_msgs.action import MoveGroup, ExecuteTrajectory
 from moveit_msgs.msg import CollisionObject, MoveItErrorCodes, RobotTrajectory, RobotState, DisplayTrajectory
 
 from nvblox_msgs.srv import EsdfAndGradients
-from rclpy.action import ActionServer
+from rclpy.action import ActionClient, ActionServer
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -130,6 +130,8 @@ class CumotionActionServer(Node):
         self._cmd_alpha = float(self.get_parameter('mpc_cmd_smoothing_alpha').get_parameter_value().double_value)
         self._cmd_max_step = float(self.get_parameter('mpc_cmd_max_step').get_parameter_value().double_value)
         self._last_cmd_pos = None
+        self._last_goal_pose_list: Optional[list] = None
+        self._auto_replan_active = False
         self._stall_ticks_thresh = int(self.get_parameter('mpc_stall_ticks').get_parameter_value().integer_value)
         self._stall_jump_pts = int(self.get_parameter('mpc_stall_jump_points').get_parameter_value().integer_value)
         if self._stall_ticks_thresh < 1:
@@ -307,6 +309,9 @@ class CumotionActionServer(Node):
         self._mpc_cmd_pub = self.create_publisher(JointTrajectory, self._mpc_cmd_topic, 10)
         # Publisher to the standard MoveIt display topic used by RViz
         self._display_traj_pub = self.create_publisher(DisplayTrajectory, '/display_planned_path', 10)
+        self._execute_traj_client = ActionClient(self, ExecuteTrajectory, '/execute_trajectory')
+        self._execute_client_ready = False
+        self._execute_warned = False
         if self._use_mpc:
             self.load_mpc()
             self._mpc_timer = self.create_timer(self._mpc_step_dt, self.mpc_tick)
@@ -360,6 +365,8 @@ class CumotionActionServer(Node):
         """Return True if any waypoint in the stored trajectory collides in the current ESDF."""
         if traj is None or traj.joint_trajectory is None:
             return False
+        if self._auto_replan_active:
+            return True
         jt = traj.joint_trajectory
         if len(jt.points) == 0:
             return False
@@ -386,12 +393,156 @@ class CumotionActionServer(Node):
             )
             try:
                 valid, status = self.motion_gen.check_start_state(js)
-            except ValueError as exc:
+            except Exception as exc:
                 self.get_logger().warn(f'Collision check exception for stored trajectory: {exc}')
                 return True
             if not valid and status == MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION:
                 return True
         return False
+
+    def _schedule_auto_replan(self):
+        if self._use_mpc:
+            return
+        if self._auto_replan_active:
+            return
+        if self._last_goal_pose_list is None:
+            self.get_logger().warn('Auto replan skipped: no cached goal pose.')
+            return
+        if self.__js_buffer is None:
+            self.get_logger().warn('Auto replan skipped: no joint state data.')
+            return
+        self._auto_replan_active = True
+        threading.Thread(
+            target=self._auto_replan_worker,
+            name='cumotion_auto_replan',
+            daemon=True,
+        ).start()
+
+    def _ensure_execute_client(self) -> bool:
+        if self._execute_client_ready:
+            return True
+        ready = self._execute_traj_client.wait_for_server(timeout_sec=0.25)
+        if ready:
+            self._execute_client_ready = True
+            self._execute_warned = False
+        else:
+            if not self._execute_warned:
+                self.get_logger().warn('ExecuteTrajectory action server not available yet.')
+                self._execute_warned = True
+        return ready
+
+    def _send_execute_trajectory(self, traj: RobotTrajectory):
+        if not self._ensure_execute_client():
+            return
+        goal = ExecuteTrajectory.Goal()
+        goal.trajectory = traj
+        try:
+            goal_future = self._execute_traj_client.send_goal_async(goal)
+            goal_future.add_done_callback(self._on_execute_traj_goal)
+        except Exception as exc:
+            self.get_logger().warn(f'Failed to send ExecuteTrajectory goal: {exc}')
+
+    def _on_execute_traj_goal(self, future):
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            self.get_logger().warn(f'ExecuteTrajectory goal exception: {exc}')
+            return
+        if not goal_handle.accepted:
+            self.get_logger().warn('ExecuteTrajectory goal rejected.')
+            return
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._on_execute_traj_result)
+
+    def _on_execute_traj_result(self, future):
+        try:
+            result = future.result()
+        except Exception as exc:
+            self.get_logger().warn(f'ExecuteTrajectory result exception: {exc}')
+            return
+        status = result.status
+        if status != 0:
+            self.get_logger().warn(f'ExecuteTrajectory finished with status {status}')
+
+    def _auto_replan_worker(self):
+        busy_claimed = False
+        try:
+            with self.lock:
+                if self.planner_busy:
+                    self.get_logger().warn('Auto replan aborted: planner busy.')
+                    return
+                self.planner_busy = True
+                busy_claimed = True
+
+            js_buffer = self.__js_buffer
+            if js_buffer is None:
+                self.get_logger().warn('Auto replan aborted: joint state buffer empty.')
+                return
+
+            joint_positions = list(js_buffer.get('position', []))
+            joint_names = list(js_buffer.get('joint_names', []))
+            if not joint_positions or not joint_names:
+                self.get_logger().warn('Auto replan aborted: joint state incomplete.')
+                return
+
+            position_tensor = self.tensor_args.to_device(joint_positions).unsqueeze(0)
+            state = CuJointState.from_position(position=position_tensor, joint_names=joint_names)
+            joint_velocities = js_buffer.get('velocity')
+            if joint_velocities:
+                joint_velocities = list(joint_velocities)
+                if len(joint_velocities) == len(joint_positions):
+                    state.velocity = self.tensor_args.to_device(joint_velocities).unsqueeze(0)
+
+            start_state = self.motion_gen.get_active_js(state)
+            goal_pose = Pose.from_list(self._last_goal_pose_list, tensor_args=self.tensor_args)
+            time_dilation_factor = float(
+                self.get_parameter('time_dilation_factor').get_parameter_value().double_value
+            )
+
+            self.motion_gen.reset(reset_seed=False)
+            replan_result = self.motion_gen.plan_single(
+                start_state,
+                goal_pose,
+                MotionGenPlanConfig(
+                    max_attempts=self.__max_attempts,
+                    enable_graph_attempt=3,
+                    time_dilation_factor=time_dilation_factor,
+                    ik_fail_return=5,
+                ),
+            )
+
+            if replan_result.success.item():
+                traj = self.get_joint_trajectory(
+                    replan_result.optimized_plan,
+                    float(replan_result.optimized_dt.item())
+                )
+                with self.lock:
+                    self._last_planned_traj = traj
+                    try:
+                        self._last_goal_pose_list = goal_pose.tolist()
+                    except Exception:
+                        pass
+                self.get_logger().info('Auto replan completed successfully (non-MPC).')
+
+                # Publish trajectory for visualization and execution
+                try:
+                    if self._display_traj_pub.get_subscription_count() > 0:
+                        display_msg = DisplayTrajectory()
+                        display_msg.trajectory.append(traj)
+                        self._display_traj_pub.publish(display_msg)
+                except Exception as exc:
+                    self.get_logger().warn(f'Failed to publish display trajectory: {exc}')
+
+                self._send_execute_trajectory(traj)
+            else:
+                self.get_logger().warn(f'Auto replan failed: {replan_result.status}')
+        except Exception as exc:
+            self.get_logger().error(f'Auto replan exception: {exc}')
+        finally:
+            if busy_claimed:
+                with self.lock:
+                    self.planner_busy = False
+            self._auto_replan_active = False
 
     def _publish_mppi_rollouts(self):
         if not self._viz_enable_mppi_rollouts or self._viz_rollouts_pub.get_subscription_count() < 1:
@@ -1092,6 +1243,7 @@ class CumotionActionServer(Node):
                 replan_msg.data = 'replan_needed'
                 self._replan_needed_pub.publish(replan_msg)
                 self.get_logger().warn('Stored trajectory collides with updated ESDF. Replan required.')
+                self._schedule_auto_replan()
 
         #self.get_logger().info('Updated ESDF grid')
         if self.__publish_curobo_world_as_voxels and self.__voxel_pub.get_subscription_count() > 0:
@@ -1411,6 +1563,10 @@ class CumotionActionServer(Node):
             result.planned_trajectory = traj
             result.planning_time = float(motion_gen_result.total_time)
             self._last_planned_traj = traj
+            try:
+                self._last_goal_pose_list = goal_pose.tolist()
+            except Exception:
+                self._last_goal_pose_list = None
 
             goal_handle.succeed()
 
