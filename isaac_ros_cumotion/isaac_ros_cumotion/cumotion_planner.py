@@ -36,6 +36,7 @@ from isaac_ros_cumotion_python_utils.utils import (
 
 from moveit_msgs.action import MoveGroup, ExecuteTrajectory
 from moveit_msgs.msg import CollisionObject, MoveItErrorCodes, RobotTrajectory, RobotState, DisplayTrajectory
+from control_msgs.action import FollowJointTrajectory
 
 from nvblox_msgs.srv import EsdfAndGradients
 from rclpy.action import ActionClient, ActionServer
@@ -312,6 +313,12 @@ class CumotionActionServer(Node):
         self._execute_traj_client = ActionClient(self, ExecuteTrajectory, '/execute_trajectory')
         self._execute_client_ready = False
         self._execute_warned = False
+        self._active_execute_goal = None
+        fjt_action = self._compute_follow_joint_traj_action_name(self._mpc_cmd_topic)
+        self._fjt_action_name = fjt_action
+        self._fjt_client = ActionClient(self, FollowJointTrajectory, fjt_action)
+        self._fjt_client_ready = False
+        self._fjt_warned = False
         if self._use_mpc:
             self.load_mpc()
             self._mpc_timer = self.create_timer(self._mpc_step_dt, self.mpc_tick)
@@ -418,6 +425,19 @@ class CumotionActionServer(Node):
             daemon=True,
         ).start()
 
+    @staticmethod
+    def _compute_follow_joint_traj_action_name(cmd_topic: str) -> str:
+        if not cmd_topic:
+            return '/follow_joint_trajectory'
+        topic = cmd_topic.rstrip('/')
+        suffix = 'joint_trajectory'
+        if topic.endswith(suffix):
+            base = topic[: -len(suffix)].rstrip('/')
+            if not base:
+                base = ''
+            return f'{base}/follow_joint_trajectory' if base else '/follow_joint_trajectory'
+        return '/follow_joint_trajectory'
+
     def _ensure_execute_client(self) -> bool:
         if self._execute_client_ready:
             return True
@@ -442,6 +462,63 @@ class CumotionActionServer(Node):
         except Exception as exc:
             self.get_logger().warn(f'Failed to send ExecuteTrajectory goal: {exc}')
 
+    def _cancel_active_execute_goal(self):
+        with self.lock:
+            goal_handle = self._active_execute_goal
+        if goal_handle is None:
+            return
+        try:
+            cancel_future = goal_handle.cancel_goal_async()
+            cancel_future.add_done_callback(self._on_execute_cancelled)
+        except Exception as exc:
+            self.get_logger().warn(f'Failed to cancel ExecuteTrajectory goal: {exc}')
+
+    def _ensure_fjt_client(self) -> bool:
+        if self._fjt_client_ready:
+            return True
+        ready = self._fjt_client.wait_for_server(timeout_sec=0.25)
+        if ready:
+            self._fjt_client_ready = True
+            self._fjt_warned = False
+        else:
+            if not self._fjt_warned:
+                self.get_logger().warn(
+                    f'FollowJointTrajectory action server {self._fjt_action_name} not available yet.'
+                )
+                self._fjt_warned = True
+        return ready
+
+    def _cancel_follow_joint_trajectory(self):
+        if not self._ensure_fjt_client():
+            return
+        try:
+            self._fjt_client.cancel_all_goals_async()
+            self.get_logger().info('Requested FollowJointTrajectory cancel.')
+        except Exception as exc:
+            self.get_logger().warn(f'Failed to cancel FollowJointTrajectory goals: {exc}')
+
+    def _publish_halt_trajectory(self):
+        js_buffer = self.__js_buffer
+        if js_buffer is None:
+            self.get_logger().warn('Unable to publish halt trajectory: no joint state data.')
+            return
+        joint_names = list(js_buffer.get('joint_names', []))
+        joint_positions = list(js_buffer.get('position', []))
+        if not joint_names or not joint_positions or len(joint_names) != len(joint_positions):
+            self.get_logger().warn('Unable to publish halt trajectory: joint state incomplete.')
+            return
+        halt_msg = JointTrajectory()
+        halt_msg.joint_names = joint_names
+        point = JointTrajectoryPoint()
+        point.positions = joint_positions
+        point.velocities = [0.0] * len(joint_positions)
+        point.time_from_start = Duration(seconds=0.0).to_msg()
+        halt_msg.points.append(point)
+        try:
+            self._mpc_cmd_pub.publish(halt_msg)
+        except Exception as exc:
+            self.get_logger().warn(f'Failed to publish halt trajectory: {exc}')
+
     def _on_execute_traj_goal(self, future):
         try:
             goal_handle = future.result()
@@ -451,6 +528,8 @@ class CumotionActionServer(Node):
         if not goal_handle.accepted:
             self.get_logger().warn('ExecuteTrajectory goal rejected.')
             return
+        with self.lock:
+            self._active_execute_goal = goal_handle
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(self._on_execute_traj_result)
 
@@ -463,6 +542,16 @@ class CumotionActionServer(Node):
         status = result.status
         if status != 0:
             self.get_logger().warn(f'ExecuteTrajectory finished with status {status}')
+        with self.lock:
+            self._active_execute_goal = None
+
+    def _on_execute_cancelled(self, future):
+        try:
+            future.result()
+        except Exception as exc:
+            self.get_logger().warn(f'ExecuteTrajectory cancel exception: {exc}')
+        with self.lock:
+            self._active_execute_goal = None
 
     def _auto_replan_worker(self):
         busy_claimed = False
@@ -533,7 +622,7 @@ class CumotionActionServer(Node):
                 except Exception as exc:
                     self.get_logger().warn(f'Failed to publish display trajectory: {exc}')
 
-                self._send_execute_trajectory(traj)
+                #self._send_execute_trajectory(traj)
             else:
                 self.get_logger().warn(f'Auto replan failed: {replan_result.status}')
         except Exception as exc:
@@ -1243,6 +1332,9 @@ class CumotionActionServer(Node):
                 replan_msg.data = 'replan_needed'
                 self._replan_needed_pub.publish(replan_msg)
                 self.get_logger().warn('Stored trajectory collides with updated ESDF. Replan required.')
+                self._publish_halt_trajectory()
+                self._cancel_follow_joint_trajectory()
+                self._cancel_active_execute_goal()
                 self._schedule_auto_replan()
 
         #self.get_logger().info('Updated ESDF grid')
