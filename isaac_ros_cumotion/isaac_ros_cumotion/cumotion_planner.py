@@ -117,15 +117,15 @@ class CumotionActionServer(Node):
         # === MPC params ===
         self.declare_parameter('use_mpc', False)
         self.declare_parameter('mpc_autorun', True)
-        self.declare_parameter('mpc_step_dt', 0.05) # 0.03 for pose control
-        self.declare_parameter('mpc_cmd_topic', '/ur_arm_controller/joint_trajectory')  # change if your controller differs
+        self.declare_parameter('mpc_step_dt', 0.04) # 0.03 for pose control
+        self.declare_parameter('mpc_cmd_topic', '/scaled_joint_trajectory_controller/joint_trajectory')  # change if your controller differs
         self.declare_parameter('mpc_world_update_period', 0.15)
         # Optional command smoothing to reduce jerkiness
-        self.declare_parameter('mpc_cmd_smoothing_alpha', 0.35)
-        self.declare_parameter('mpc_cmd_max_step', 0.08)
+        self.declare_parameter('mpc_cmd_smoothing_alpha', 0.55)
+        self.declare_parameter('mpc_cmd_max_step', 0.01)
         # Progress watchdog: skip ahead if stalled
-        self.declare_parameter('mpc_stall_ticks', 15)          # ticks without advancing before forcing jump
-        self.declare_parameter('mpc_stall_jump_points', 3)     # points to jump ahead when stalled
+        self.declare_parameter('mpc_stall_ticks', 1)          # ticks without advancing before forcing jump
+        self.declare_parameter('mpc_stall_jump_points', 1)     # points to jump ahead when stalled
         self._mg_path = None     # dict with EE xyz [N,3], s [N], q_mpc [N,DoF], names, etc.
         self._ema_pose_err = 0.0 # for adaptive look-ahead
         self._cmd_alpha = float(self.get_parameter('mpc_cmd_smoothing_alpha').get_parameter_value().double_value)
@@ -143,7 +143,7 @@ class CumotionActionServer(Node):
 
         # Look-ahead parameters
         self.declare_parameter('mpc_lookahead_m', 0.35)           # nominal 20 cm
-        self.declare_parameter('mpc_min_lookahead_voxels', 4)     # >= 3 * voxel_size
+        self.declare_parameter('mpc_min_lookahead_voxels', 20)     # >= 3 * voxel_size
         self._mpc_lookahead_m = self.get_parameter('mpc_lookahead_m').get_parameter_value().double_value
         self._mpc_min_lookahead_voxels = self.get_parameter('mpc_min_lookahead_voxels').get_parameter_value().integer_value
         self._goal = None
