@@ -5,7 +5,7 @@ from copy import deepcopy
 from os import path
 import threading
 import time
-from typing import Optional
+from typing import List, Optional, Sequence
 import numpy as np
 import torch
 import rclpy
@@ -37,6 +37,8 @@ from isaac_ros_cumotion_python_utils.utils import (
 from moveit_msgs.action import MoveGroup, ExecuteTrajectory
 from moveit_msgs.msg import CollisionObject, MoveItErrorCodes, RobotTrajectory, RobotState, DisplayTrajectory
 from control_msgs.action import FollowJointTrajectory
+
+from action_msgs.srv import CancelGoal
 
 from nvblox_msgs.srv import EsdfAndGradients
 from rclpy.action import ActionClient, ActionServer
@@ -111,7 +113,7 @@ class CumotionActionServer(Node):
         self._esdf_change_pub = self.create_publisher(String, 'cumotion/esdf_change', 1)
         self._replan_needed_pub = self.create_publisher(String, 'cumotion/replan_needed', 1)
         self._prev_esdf_tensor = None
-
+        self._controller_joint_names = []
 
 
         # === MPC params ===
@@ -319,6 +321,13 @@ class CumotionActionServer(Node):
         self._fjt_client = ActionClient(self, FollowJointTrajectory, fjt_action)
         self._fjt_client_ready = False
         self._fjt_warned = False
+        cancel_service_name = path.join(fjt_action, '_action', 'cancel_goal') if fjt_action.startswith('/') \
+            else f'{fjt_action}/_action/cancel_goal'
+        cancel_service_name = cancel_service_name.replace('//', '/')
+        self._fjt_cancel_service_name = cancel_service_name
+        self._fjt_cancel_client = self.create_client(CancelGoal, cancel_service_name)
+        self._fjt_cancel_ready = False
+        self._fjt_cancel_warned = False
         if self._use_mpc:
             self.load_mpc()
             self._mpc_timer = self.create_timer(self._mpc_step_dt, self.mpc_tick)
@@ -470,6 +479,7 @@ class CumotionActionServer(Node):
         try:
             cancel_future = goal_handle.cancel_goal_async()
             cancel_future.add_done_callback(self._on_execute_cancelled)
+            self.get_logger().info('Requested ExecuteTrajectory goal cancel.')
         except Exception as exc:
             self.get_logger().warn(f'Failed to cancel ExecuteTrajectory goal: {exc}')
 
@@ -488,14 +498,90 @@ class CumotionActionServer(Node):
                 self._fjt_warned = True
         return ready
 
+    def _ensure_fjt_cancel_client(self) -> bool:
+        if self._fjt_cancel_ready:
+            return True
+        ready = self._fjt_cancel_client.wait_for_service(timeout_sec=0.25)
+        if ready:
+            self._fjt_cancel_ready = True
+            self._fjt_cancel_warned = False
+        else:
+            if not self._fjt_cancel_warned:
+                self.get_logger().warn(
+                    f'FollowJointTrajectory cancel service {self._fjt_cancel_service_name} not available yet.'
+                )
+                self._fjt_cancel_warned = True
+        return ready
+
     def _cancel_follow_joint_trajectory(self):
         if not self._ensure_fjt_client():
             return
+        if not self._ensure_fjt_cancel_client():
+            return
         try:
-            self._fjt_client.cancel_all_goals_async()
+            cancel_request = CancelGoal.Request()
+            cancel_request.goal_info.goal_id.uuid = [0] * len(cancel_request.goal_info.goal_id.uuid)
+            cancel_future = self._fjt_cancel_client.call_async(cancel_request)
+            cancel_future.add_done_callback(self._on_fjt_cancel_response)
             self.get_logger().info('Requested FollowJointTrajectory cancel.')
         except Exception as exc:
             self.get_logger().warn(f'Failed to cancel FollowJointTrajectory goals: {exc}')
+
+    def _get_ordered_controller_joints(self, available_names: Sequence[str]) -> Optional[List[str]]:
+        """Return controller joint order with exclusions applied, ensuring all names are available."""
+        available_set = set(available_names)
+        if self._controller_joint_names:
+            ordered = [name for name in self._controller_joint_names if name not in self._excluded_joint_names]
+            missing = [name for name in ordered if name not in available_set]
+            if missing:
+                self.get_logger().warn(
+                    f'Controller joint ordering missing joints from source: {missing}'
+                )
+                return None
+            return ordered
+
+        ordered = [name for name in available_names if name not in self._excluded_joint_names]
+        if not ordered:
+            return None
+        return ordered
+
+    def _build_controller_trajectory(self, joint_traj: JointTrajectory) -> Optional[JointTrajectory]:
+        """Reorder and filter a JointTrajectory so it matches the controller joint list."""
+        if joint_traj is None or not joint_traj.joint_names:
+            return None
+
+        ordered = self._get_ordered_controller_joints(joint_traj.joint_names)
+        if not ordered:
+            self.get_logger().warn('Unable to prepare controller trajectory: no valid joint ordering.')
+            return None
+
+        try:
+            indices = [joint_traj.joint_names.index(name) for name in ordered]
+        except ValueError as exc:
+            self.get_logger().warn(f'Controller joint ordering failed: {exc}')
+            return None
+
+        command = JointTrajectory()
+        command.joint_names = list(ordered)
+        try:
+            command.header = deepcopy(joint_traj.header)
+        except Exception:
+            command.header = joint_traj.header
+        command.header.stamp = self.get_clock().now().to_msg()
+
+        for point in joint_traj.points:
+            cmd_point = JointTrajectoryPoint()
+            if point.positions:
+                cmd_point.positions = [point.positions[i] for i in indices]
+            if point.velocities:
+                cmd_point.velocities = [point.velocities[i] for i in indices]
+            if point.accelerations:
+                cmd_point.accelerations = [point.accelerations[i] for i in indices]
+            if point.effort:
+                cmd_point.effort = [point.effort[i] for i in indices]
+            cmd_point.time_from_start = point.time_from_start
+            command.points.append(cmd_point)
+        return command
 
     def _publish_halt_trajectory(self):
         js_buffer = self.__js_buffer
@@ -507,15 +593,30 @@ class CumotionActionServer(Node):
         if not joint_names or not joint_positions or len(joint_names) != len(joint_positions):
             self.get_logger().warn('Unable to publish halt trajectory: joint state incomplete.')
             return
+        controller_joints = self._get_ordered_controller_joints(joint_names)
+        if not controller_joints:
+            self.get_logger().warn('Unable to publish halt trajectory: controller joint ordering unavailable.')
+            return
+        name_to_position = {name: pos for name, pos in zip(joint_names, joint_positions)}
+        js_velocities = list(js_buffer.get('velocity', [])) if js_buffer.get('velocity', None) else []
+        has_velocity = js_velocities and len(js_velocities) == len(joint_names)
+        name_to_velocity = {name: vel for name, vel in zip(joint_names, js_velocities)} if has_velocity else {}
+        missing_names = [name for name in controller_joints if name not in name_to_position]
+        if missing_names:
+            self.get_logger().warn(f'Unable to publish halt trajectory: missing joints {missing_names}.')
+            return
+        positions = [name_to_position[name] for name in controller_joints]
+        velocities = [name_to_velocity.get(name, 0.0) for name in controller_joints]
         halt_msg = JointTrajectory()
-        halt_msg.joint_names = joint_names
+        halt_msg.joint_names = controller_joints
         point = JointTrajectoryPoint()
-        point.positions = joint_positions
-        point.velocities = [0.0] * len(joint_positions)
+        point.positions = positions
+        point.velocities = velocities if has_velocity else [0.0] * len(controller_joints)
         point.time_from_start = Duration(seconds=0.0).to_msg()
         halt_msg.points.append(point)
         try:
             self._mpc_cmd_pub.publish(halt_msg)
+            self.get_logger().info(f'Published halt trajectory successfully.')
         except Exception as exc:
             self.get_logger().warn(f'Failed to publish halt trajectory: {exc}')
 
@@ -552,6 +653,12 @@ class CumotionActionServer(Node):
             self.get_logger().warn(f'ExecuteTrajectory cancel exception: {exc}')
         with self.lock:
             self._active_execute_goal = None
+
+    def _on_fjt_cancel_response(self, future):
+        try:
+            future.result()
+        except Exception as exc:
+            self.get_logger().warn(f'FollowJointTrajectory cancel request failed: {exc}')
 
     def _auto_replan_worker(self):
         busy_claimed = False
@@ -622,7 +729,17 @@ class CumotionActionServer(Node):
                 except Exception as exc:
                     self.get_logger().warn(f'Failed to publish display trajectory: {exc}')
 
-                #self._send_execute_trajectory(traj)
+                # Publish the updated plan to the controller directly
+                controller_traj = self._build_controller_trajectory(traj.joint_trajectory)
+                if controller_traj is not None:
+                    try:
+                        self._mpc_cmd_pub.publish(controller_traj)
+                        self._controller_joint_names = list(controller_traj.joint_names)
+                        self.get_logger().info('Published auto replan trajectory to controller.')
+                    except Exception as exc:
+                        self.get_logger().warn(f'Failed to publish auto replan trajectory: {exc}')
+                else:
+                    self.get_logger().warn('Auto replan succeeded, but trajectory could not be matched to controller joints.')
             else:
                 self.get_logger().warn(f'Auto replan failed: {replan_result.status}')
         except Exception as exc:
@@ -793,6 +910,10 @@ class CumotionActionServer(Node):
         )
 
         self.motion_gen = MotionGen(motion_gen_config)
+        try:
+            self._controller_joint_names = list(self.motion_gen.rollout_fn.joint_names)
+        except Exception:
+            self._controller_joint_names = []
         self.__robot_base_frame = self.motion_gen.kinematics.base_link
         self.__world_collision = self.motion_gen.world_coll_checker
         if not self.__add_ground_plane:
@@ -818,6 +939,10 @@ class CumotionActionServer(Node):
         )
 
         self.mpc = MpcSolver(mpc_config)
+        try:
+            self._controller_joint_names = list(self.mpc.rollout_fn.joint_names)
+        except Exception:
+            pass
         self.get_logger().info('MPC initialized (MPPI).')
 
     def warmup(self):
@@ -1095,6 +1220,7 @@ class CumotionActionServer(Node):
                     pt.velocities = vel_tensor[0].detach().cpu().numpy().tolist()
                 pt.time_from_start = Duration(seconds=self._mpc_step_dt).to_msg()
                 joint_trajectory_msg.points.append(pt)
+                self._controller_joint_names = list(joint_trajectory_msg.joint_names)
                 self._mpc_cmd_pub.publish(joint_trajectory_msg)
                 # Compute total execution time
                 total_execution_time = time.time() - now
@@ -1202,6 +1328,7 @@ class CumotionActionServer(Node):
                         pt.velocities = vel_tensor[0].detach().cpu().numpy().tolist()
                     pt.time_from_start = Duration(seconds=self._mpc_step_dt).to_msg()
                     jt.points.append(pt)
+                    self._controller_joint_names = list(jt.joint_names)
                     self._mpc_cmd_pub.publish(jt)
             except Exception as e:
                 self.get_logger().warn(f'Direct-goal MPC tick failed: {e}')
