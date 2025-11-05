@@ -12,6 +12,7 @@ from os import path
 
 import threading
 import time
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from curobo.geom.sdf.world import CollisionCheckerType
 from curobo.geom.types import Cuboid
@@ -42,6 +43,7 @@ from moveit_msgs.msg import RobotTrajectory
 import numpy as np
 from nvblox_msgs.srv import EsdfAndGradients
 import rclpy
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType, ParameterValue
 from rclpy.action import ActionServer
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -95,6 +97,11 @@ class CumotionActionServer(Node):
         self.declare_parameter('override_moveit_scaling_factors', False)
         self.declare_parameter('update_link_sphere_server',
                                'planner_attach_object')
+        self.declare_parameter(
+            'disable_collision_link_map',
+            ParameterValue(type=ParameterType.PARAMETER_STRING_ARRAY, string_array_value=[]),
+            descriptor=ParameterDescriptor(type=ParameterType.PARAMETER_STRING_ARRAY)
+        )
         debug_mode = (
             self.get_parameter('enable_curobo_debug_mode').get_parameter_value().bool_value
         )
@@ -145,6 +152,8 @@ class CumotionActionServer(Node):
         self.__override_moveit_scaling_factors = (
             self.get_parameter('override_moveit_scaling_factors').get_parameter_value().bool_value
         )
+        disable_map_param = self.get_parameter('disable_collision_link_map').get_parameter_value().string_array_value
+        self._disable_collision_link_map = self._parse_disable_collision_link_map(disable_map_param)
 
         # Motion generation parameters
 
@@ -447,6 +456,74 @@ class CumotionActionServer(Node):
         self.__world_collision.update_voxel_data(esdf_grid)
         self.get_logger().info('Updated ESDF grid')
         return True
+
+    def _parse_disable_collision_link_map(self, entries: Sequence[str]) -> Dict[str, List[str]]:
+        mapping: Dict[str, List[str]] = {}
+        for raw_entry in entries or []:
+            entry = raw_entry.strip()
+            if not entry:
+                continue
+            if ':' not in entry:
+                self.get_logger().warn(
+                    f"disable_collision_link_map entry '{entry}' is missing ':' separator; expected 'group:link1,link2'."
+                )
+                continue
+            group, links_str = entry.split(':', 1)
+            group = group.strip()
+            if not group:
+                self.get_logger().warn(
+                    f"disable_collision_link_map entry '{entry}' has an empty group name; skipping."
+                )
+                continue
+            links = [link.strip() for link in links_str.split(',') if link.strip()]
+            if not links:
+                self.get_logger().warn(
+                    f"disable_collision_link_map entry '{entry}' does not list any links; skipping."
+                )
+                continue
+            mapping[group] = links
+        return mapping
+
+    def _toggle_link_collision(self, link_names: Sequence[str], enable_flag: bool) -> None:
+        if not link_names:
+            return
+        for link in link_names:
+            try:
+                if enable_flag:
+                    self.motion_gen.kinematics.kinematics_config.enable_link_spheres(link)
+                else:
+                    self.motion_gen.kinematics.kinematics_config.disable_link_spheres(link)
+            except Exception as exc:
+                action = 'enable' if enable_flag else 'disable'
+                self.get_logger().warn(
+                    f"Failed to {action} collision checking for link '{link}': {exc}"
+                )
+
+    def _apply_disable_collision_links_if_requested(self, plan_req) -> Tuple[bool, List[str]]:
+        goal_constraints = plan_req.goal_constraints
+        if not goal_constraints:
+            return False, []
+
+        marker = goal_constraints[0].name if goal_constraints[0].name else ''
+        if marker != 'disable_collision_links':
+            return False, []
+
+        group_name = plan_req.group_name or ''
+        if not group_name:
+            self.get_logger().warn(
+                'disable_collision_links requested but group_name is empty; ignoring request.'
+            )
+            return False, []
+
+        links = self._disable_collision_link_map.get(group_name, [])
+        if not links:
+            self.get_logger().warn(
+                f"disable_collision_links requested for '{group_name}' but no links were configured in disable_collision_link_map."
+            )
+            return False, []
+
+        self._toggle_link_collision(links, False)
+        return True, list(links)
 
     def send_request(self, aabb_min_m, aabb_size_m):
         self.__esdf_req.visualize_esdf = True
@@ -849,64 +926,72 @@ class CumotionActionServer(Node):
         goal_pose_end_time = time.time()
         self.get_logger().info(f'Goal pose calculation took {goal_pose_end_time - goal_pose_start_time:.4f} seconds')
 
-        with self.lock:
-            self.planner_busy = True
+        disable_links_applied = False
+        disabled_links: List[str] = []
+        try:
+            disable_links_applied, disabled_links = self._apply_disable_collision_links_if_requested(plan_req)
 
-        planning_start_time = time.time()
-        self.motion_gen.reset(reset_seed=False)
-        motion_gen_result = self.motion_gen.plan_single(
-            start_state,
-            goal_pose,
-            MotionGenPlanConfig(max_attempts=self.__max_attempts, enable_graph_attempt=3,
-                                time_dilation_factor=time_dilation_factor, ik_fail_return= 5),
-        )
-        planning_end_time = time.time()
-        self.get_logger().info(f'Motion planning took {planning_end_time - planning_start_time:.4f} seconds')
+            with self.lock:
+                self.planner_busy = True
 
-        with self.lock:
-            self.planner_busy = False
-        result = MoveGroup.Result()
-        if motion_gen_result.success.item():
-            result.error_code.val = MoveItErrorCodes.SUCCESS
-            result.trajectory_start = plan_req.start_state
-            traj = self.get_joint_trajectory(
-                motion_gen_result.optimized_plan, motion_gen_result.optimized_dt.item()
+            planning_start_time = time.time()
+            self.motion_gen.reset(reset_seed=False)
+            motion_gen_result = self.motion_gen.plan_single(
+                start_state,
+                goal_pose,
+                MotionGenPlanConfig(max_attempts=self.__max_attempts, enable_graph_attempt=3,
+                                    time_dilation_factor=time_dilation_factor, ik_fail_return= 5),
             )
-            result.planning_time = motion_gen_result.total_time
-            result.planned_trajectory = traj
-        elif not motion_gen_result.valid_query:
-            self.get_logger().error(
-                f'Invalid planning query: {motion_gen_result.status}'
+            planning_end_time = time.time()
+            self.get_logger().info(f'Motion planning took {planning_end_time - planning_start_time:.4f} seconds')
+
+            with self.lock:
+                self.planner_busy = False
+            result = MoveGroup.Result()
+            if motion_gen_result.success.item():
+                result.error_code.val = MoveItErrorCodes.SUCCESS
+                result.trajectory_start = plan_req.start_state
+                traj = self.get_joint_trajectory(
+                    motion_gen_result.optimized_plan, motion_gen_result.optimized_dt.item()
+                )
+                result.planning_time = motion_gen_result.total_time
+                result.planned_trajectory = traj
+            elif not motion_gen_result.valid_query:
+                self.get_logger().error(
+                    f'Invalid planning query: {motion_gen_result.status}'
+                )
+                if motion_gen_result.status == MotionGenStatus.INVALID_START_STATE_JOINT_LIMITS:
+                    result.error_code.val = MoveItErrorCodes.START_STATE_INVALID
+                if motion_gen_result.status in [
+                        MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION,
+                        MotionGenStatus.INVALID_START_STATE_SELF_COLLISION,
+                ]:
+
+                    result.error_code.val = MoveItErrorCodes.START_STATE_IN_COLLISION
+            else:
+                self.get_logger().error(
+                    f'Motion planning failed wih status: {motion_gen_result.status}'
+                )
+                if motion_gen_result.status == MotionGenStatus.IK_FAIL:
+                    result.error_code.val = MoveItErrorCodes.NO_IK_SOLUTION
+
+            self.get_logger().info(
+                'returned planning result (query, success, failure_status): '
+                + str(self.__query_count)
+                + ' '
+                + str(motion_gen_result.success.item())
+                + ' '
+                + str(motion_gen_result.status)
             )
-            if motion_gen_result.status == MotionGenStatus.INVALID_START_STATE_JOINT_LIMITS:
-                result.error_code.val = MoveItErrorCodes.START_STATE_INVALID
-            if motion_gen_result.status in [
-                    MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION,
-                    MotionGenStatus.INVALID_START_STATE_SELF_COLLISION,
-            ]:
+            self.__query_count += 1
 
-                result.error_code.val = MoveItErrorCodes.START_STATE_IN_COLLISION
-        else:
-            self.get_logger().error(
-                f'Motion planning failed wih status: {motion_gen_result.status}'
-            )
-            if motion_gen_result.status == MotionGenStatus.IK_FAIL:
-                result.error_code.val = MoveItErrorCodes.NO_IK_SOLUTION
+            total_execution_time = time.time() - start_time
+            self.get_logger().info(f'Total execution time for execute_callback: {total_execution_time:.4f} seconds')
 
-        self.get_logger().info(
-            'returned planning result (query, success, failure_status): '
-            + str(self.__query_count)
-            + ' '
-            + str(motion_gen_result.success.item())
-            + ' '
-            + str(motion_gen_result.status)
-        )
-        self.__query_count += 1
-
-        total_execution_time = time.time() - start_time
-        self.get_logger().info(f'Total execution time for execute_callback: {total_execution_time:.4f} seconds')
-
-        return result
+            return result
+        finally:
+            if disable_links_applied:
+                self._toggle_link_collision(disabled_links, True)
 
     def publish_voxels(self, voxels):
         vox_size = self.__publish_voxel_size
