@@ -12,7 +12,7 @@ from os import path
 
 import threading
 import time
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Sequence, Set, Tuple
 
 from curobo.geom.sdf.world import CollisionCheckerType
 from curobo.geom.types import Cuboid
@@ -153,7 +153,9 @@ class CumotionActionServer(Node):
             self.get_parameter('override_moveit_scaling_factors').get_parameter_value().bool_value
         )
         disable_map_param = self.get_parameter('disable_collision_link_map').get_parameter_value().string_array_value
-        self._disable_collision_link_map = self._parse_disable_collision_link_map(disable_map_param)
+        self._disable_collision_variants = self._parse_disable_collision_link_map(disable_map_param)
+        self._disable_collision_link_map: Dict[str, List[str]] = {}
+        self._available_link_spheres: Set[str] = set()
 
         # Motion generation parameters
 
@@ -406,6 +408,8 @@ class CumotionActionServer(Node):
             self.motion_gen.clear_world_cache()
         self.__cumotion_grid_shape = self.__world_collision.get_voxel_grid(
             'world_voxel').get_grid_shape()[0]
+        self._available_link_spheres = self._collect_available_link_spheres()
+        self._refresh_disable_collision_link_map()
 
     def warmup(self):
         self.get_logger().info('warming up cuMotion, wait until ready')
@@ -457,6 +461,80 @@ class CumotionActionServer(Node):
         self.get_logger().info('Updated ESDF grid')
         return True
 
+    def _collect_available_link_spheres(self) -> Set[str]:
+        kinematics = getattr(self.motion_gen, 'kinematics', None)
+        if kinematics is None:
+            return set()
+        kin_cfg = getattr(kinematics, 'kinematics_config', None)
+        if kin_cfg is None:
+            return set()
+        link_map = getattr(kin_cfg, 'link_name_to_idx_map', None)
+        if isinstance(link_map, dict):
+            return set(link_map.keys())
+        link_names = getattr(kin_cfg, 'link_names', None)
+        if isinstance(link_names, (list, tuple)):
+            return set(link_names)
+        return set()
+
+    def _refresh_disable_collision_link_map(self) -> None:
+        available_links = self._available_link_spheres
+        candidate_map: Dict[str, List[Tuple[int, List[str], str]]] = {}
+
+        for qualified_group, links in self._disable_collision_variants.items():
+            variant_part, sep, group_part = qualified_group.partition('|')
+            variant_name = variant_part.strip() if sep else ''
+            group_name = group_part.strip() if sep else variant_part.strip()
+
+            if not group_name:
+                self.get_logger().warn(
+                    "disable_collision_link_map entry '%s' results in an empty group name; skipping.",
+                    qualified_group
+                )
+                continue
+
+            filtered_links = list(links)
+            if available_links:
+                filtered_links = [link for link in links if link in available_links]
+                missing_links = sorted(set(links) - set(filtered_links))
+                if missing_links:
+                    message = (
+                        f"Ignoring {len(missing_links)} link(s) for group '{group_name}' "
+                        f"(variant '{variant_name or 'default'}') not present in current kinematics: "
+                        f"{', '.join(missing_links)}"
+                    )
+                    self.get_logger().debug(message)
+
+            if available_links and not filtered_links:
+                message = (
+                    f"No matching links for disable_collision_links group '{group_name}' "
+                    f"(variant '{variant_name or 'default'}'); skipping candidate."
+                )
+                self.get_logger().debug(message)
+                continue
+
+            match_count = len(filtered_links) if available_links else len(links)
+            candidate_map.setdefault(group_name, []).append((match_count, filtered_links, variant_name))
+
+        updated_map: Dict[str, List[str]] = {}
+        for group_name, candidates in candidate_map.items():
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            best_match_count, best_links, best_variant = candidates[0]
+            if best_match_count == 0:
+                continue
+            updated_map[group_name] = best_links
+            message = (
+                f"Selecting disable_collision_links entry for group '{group_name}' "
+                f"(variant '{best_variant or 'default'}') with {best_match_count} matching link(s)."
+            )
+            self.get_logger().debug(message)
+
+        if not updated_map and self._disable_collision_variants:
+            self.get_logger().warn(
+                "Unable to match any disable_collision_link_map entries against available link spheres; no links will be toggled."
+            )
+
+        self._disable_collision_link_map = updated_map
+
     def _parse_disable_collision_link_map(self, entries: Sequence[str]) -> Dict[str, List[str]]:
         mapping: Dict[str, List[str]] = {}
         for raw_entry in entries or []:
@@ -488,6 +566,12 @@ class CumotionActionServer(Node):
         if not link_names:
             return
         for link in link_names:
+            if self._available_link_spheres and link not in self._available_link_spheres:
+                self.get_logger().debug(
+                    "Link '%s' is not present in the current robot model; skipping collision toggle.",
+                    link
+                )
+                continue
             try:
                 if enable_flag:
                     self.motion_gen.kinematics.kinematics_config.enable_link_spheres(link)
@@ -519,6 +603,24 @@ class CumotionActionServer(Node):
         if not links:
             self.get_logger().warn(
                 f"disable_collision_links requested for '{group_name}' but no links were configured in disable_collision_link_map."
+            )
+            return False, []
+
+        if self._available_link_spheres:
+            filtered_links = [link for link in links if link in self._available_link_spheres]
+            missing = sorted(set(links) - set(filtered_links))
+            if missing:
+                self.get_logger().debug(
+                    "disable_collision_links request for '%s' skipped %s link(s) not present in kinematics: %s",
+                    group_name,
+                    len(missing),
+                    ', '.join(missing)
+                )
+            links = filtered_links
+
+        if not links:
+            self.get_logger().warn(
+                f"disable_collision_links request for '{group_name}' did not match any available robot links; ignoring."
             )
             return False, []
 
