@@ -102,6 +102,11 @@ class CumotionActionServer(Node):
             ParameterValue(type=ParameterType.PARAMETER_STRING_ARRAY, string_array_value=[]),
             descriptor=ParameterDescriptor(type=ParameterType.PARAMETER_STRING_ARRAY)
         )
+        self.declare_parameter(
+            'disable_collision_object_map',
+            ParameterValue(type=ParameterType.PARAMETER_STRING_ARRAY, string_array_value=[]),
+            descriptor=ParameterDescriptor(type=ParameterType.PARAMETER_STRING_ARRAY)
+        )
         debug_mode = (
             self.get_parameter('enable_curobo_debug_mode').get_parameter_value().bool_value
         )
@@ -154,7 +159,10 @@ class CumotionActionServer(Node):
         )
         disable_map_param = self.get_parameter('disable_collision_link_map').get_parameter_value().string_array_value
         self._disable_collision_variants = self._parse_disable_collision_link_map(disable_map_param)
+        disable_object_map_param = self.get_parameter('disable_collision_object_map').get_parameter_value().string_array_value
+        self._raw_disable_collision_object_map = self._parse_disable_collision_link_map(disable_object_map_param)
         self._disable_collision_link_map: Dict[str, List[str]] = {}
+        self._disable_collision_object_map: Dict[str, List[str]] = {}
         self._available_link_spheres: Set[str] = set()
 
         # Motion generation parameters
@@ -410,6 +418,7 @@ class CumotionActionServer(Node):
             'world_voxel').get_grid_shape()[0]
         self._available_link_spheres = self._collect_available_link_spheres()
         self._refresh_disable_collision_link_map()
+        self._refresh_disable_collision_object_map()
 
     def warmup(self):
         self.get_logger().info('warming up cuMotion, wait until ready')
@@ -535,6 +544,37 @@ class CumotionActionServer(Node):
 
         self._disable_collision_link_map = updated_map
 
+    def _refresh_disable_collision_object_map(self) -> None:
+        raw_map = getattr(self, '_raw_disable_collision_object_map', {})
+        if not raw_map:
+            self._disable_collision_object_map = {}
+            return
+
+        available_links = self._available_link_spheres
+        updated: Dict[str, List[str]] = {}
+
+        for group_name, links in raw_map.items():
+            filtered_links = list(links)
+            if available_links:
+                filtered_links = [link for link in links if link in available_links]
+                missing = sorted(set(links) - set(filtered_links))
+                if missing:
+                    msg = (
+                        f"disable_collision_objects config for '{group_name}' skipped {len(missing)} link(s) not present in current kinematics: "
+                        + ', '.join(missing)
+                    )
+                    self.get_logger().debug(msg)
+
+            if not filtered_links:
+                self.get_logger().warn(
+                    f"disable_collision_objects config for '{group_name}' did not match any available robot links; skipping."
+                )
+                continue
+
+            updated[group_name] = filtered_links
+
+        self._disable_collision_object_map = updated
+
     def _parse_disable_collision_link_map(self, entries: Sequence[str]) -> Dict[str, List[str]]:
         mapping: Dict[str, List[str]] = {}
         for raw_entry in entries or []:
@@ -621,6 +661,38 @@ class CumotionActionServer(Node):
         if not links:
             self.get_logger().warn(
                 f"disable_collision_links request for '{group_name}' did not match any available robot links; ignoring."
+            )
+            return False, []
+
+        self._toggle_link_collision(links, False)
+        return True, list(links)
+
+    def _apply_disable_collision_objects_if_requested(self, plan_req) -> Tuple[bool, List[str]]:
+        goal_constraints = plan_req.goal_constraints
+        if not goal_constraints:
+            return False, []
+
+        marker_found = False
+        for constraint in goal_constraints:
+            marker = constraint.name if constraint.name else ''
+            if marker == 'disable_collision_objects':
+                marker_found = True
+                break
+
+        if not marker_found:
+            return False, []
+
+        group_name = plan_req.group_name or ''
+        if not group_name:
+            self.get_logger().warn(
+                'disable_collision_objects requested but group_name is empty; ignoring request.'
+            )
+            return False, []
+
+        links = self._disable_collision_object_map.get(group_name, [])
+        if not links:
+            self.get_logger().warn(
+                f"disable_collision_objects requested for '{group_name}' but no links were configured in disable_collision_object_map."
             )
             return False, []
 
@@ -1029,9 +1101,12 @@ class CumotionActionServer(Node):
         self.get_logger().info(f'Goal pose calculation took {goal_pose_end_time - goal_pose_start_time:.4f} seconds')
 
         disable_links_applied = False
+        disable_objects_applied = False
         disabled_links: List[str] = []
+        disabled_object_links: List[str] = []
         try:
             disable_links_applied, disabled_links = self._apply_disable_collision_links_if_requested(plan_req)
+            disable_objects_applied, disabled_object_links = self._apply_disable_collision_objects_if_requested(plan_req)
 
             with self.lock:
                 self.planner_busy = True
@@ -1094,6 +1169,8 @@ class CumotionActionServer(Node):
         finally:
             if disable_links_applied:
                 self._toggle_link_collision(disabled_links, True)
+            if disable_objects_applied:
+                self._toggle_link_collision(disabled_object_links, True)
 
     def publish_voxels(self, voxels):
         vox_size = self.__publish_voxel_size
