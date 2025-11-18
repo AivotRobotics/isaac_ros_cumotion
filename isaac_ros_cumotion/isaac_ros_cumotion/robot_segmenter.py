@@ -35,6 +35,7 @@ from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 import torch
 from visualization_msgs.msg import MarkerArray
+from rclpy.time import Time
 
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -325,7 +326,7 @@ class CumotionRobotSegmenter(Node):
                         t = self.tf_buffer.lookup_transform(
                             self._cumotion_base_frame,
                             camera_headers[i].frame_id,
-                            timestamp,
+                            Time(),
                             rclpy.duration.Duration(seconds=self._tf_lookup_duration),
                         )
                         self._robot_pose_camera[i] = CuPose.from_list(
