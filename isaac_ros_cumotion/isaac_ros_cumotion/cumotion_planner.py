@@ -117,7 +117,7 @@ class CumotionActionServer(Node):
 
 
         # === MPC params ===
-        self.declare_parameter('use_mpc', False)
+        self.declare_parameter('use_mpc', True)
         self.declare_parameter('mpc_autorun', True)
         self.declare_parameter('mpc_step_dt', 0.04) # 0.03 for pose control
         self.declare_parameter('mpc_cmd_topic', '/scaled_joint_trajectory_controller/joint_trajectory')  # change if your controller differs
@@ -135,6 +135,10 @@ class CumotionActionServer(Node):
         self._last_cmd_pos = None
         self._last_goal_pose_list: Optional[list] = None
         self._auto_replan_active = False
+        self.declare_parameter('auto_replan_retry_delay', 0.5)
+        self._auto_replan_retry_delay = float(
+            self.get_parameter('auto_replan_retry_delay').get_parameter_value().double_value
+        )
         self._stall_ticks_thresh = int(self.get_parameter('mpc_stall_ticks').get_parameter_value().integer_value)
         self._stall_jump_pts = int(self.get_parameter('mpc_stall_jump_points').get_parameter_value().integer_value)
         if self._stall_ticks_thresh < 1:
@@ -662,6 +666,7 @@ class CumotionActionServer(Node):
 
     def _auto_replan_worker(self):
         busy_claimed = False
+        attempt = 0
         try:
             with self.lock:
                 if self.planner_busy:
@@ -670,78 +675,82 @@ class CumotionActionServer(Node):
                 self.planner_busy = True
                 busy_claimed = True
 
-            js_buffer = self.__js_buffer
-            if js_buffer is None:
-                self.get_logger().warn('Auto replan aborted: joint state buffer empty.')
-                return
+            while True:
+                attempt += 1
+                js_buffer = self.__js_buffer
+                if js_buffer is None:
+                    self.get_logger().warn('Auto replan aborted: joint state buffer empty.')
+                    return
 
-            joint_positions = list(js_buffer.get('position', []))
-            joint_names = list(js_buffer.get('joint_names', []))
-            if not joint_positions or not joint_names:
-                self.get_logger().warn('Auto replan aborted: joint state incomplete.')
-                return
+                joint_positions = list(js_buffer.get('position', []))
+                joint_names = list(js_buffer.get('joint_names', []))
+                if not joint_positions or not joint_names:
+                    self.get_logger().warn('Auto replan aborted: joint state incomplete.')
+                    return
 
-            position_tensor = self.tensor_args.to_device(joint_positions).unsqueeze(0)
-            state = CuJointState.from_position(position=position_tensor, joint_names=joint_names)
-            joint_velocities = js_buffer.get('velocity')
-            if joint_velocities:
-                joint_velocities = list(joint_velocities)
-                if len(joint_velocities) == len(joint_positions):
-                    state.velocity = self.tensor_args.to_device(joint_velocities).unsqueeze(0)
+                position_tensor = self.tensor_args.to_device(joint_positions).unsqueeze(0)
+                state = CuJointState.from_position(position=position_tensor, joint_names=joint_names)
+                joint_velocities = js_buffer.get('velocity')
+                if joint_velocities:
+                    joint_velocities = list(joint_velocities)
+                    if len(joint_velocities) == len(joint_positions):
+                        state.velocity = self.tensor_args.to_device(joint_velocities).unsqueeze(0)
 
-            start_state = self.motion_gen.get_active_js(state)
-            goal_pose = Pose.from_list(self._last_goal_pose_list, tensor_args=self.tensor_args)
-            time_dilation_factor = float(
-                self.get_parameter('time_dilation_factor').get_parameter_value().double_value
-            )
-
-            self.motion_gen.reset(reset_seed=False)
-            replan_result = self.motion_gen.plan_single(
-                start_state,
-                goal_pose,
-                MotionGenPlanConfig(
-                    max_attempts=self.__max_attempts,
-                    enable_graph_attempt=3,
-                    time_dilation_factor=time_dilation_factor,
-                    ik_fail_return=5,
-                ),
-            )
-
-            if replan_result.success.item():
-                traj = self.get_joint_trajectory(
-                    replan_result.optimized_plan,
-                    float(replan_result.optimized_dt.item())
+                start_state = self.motion_gen.get_active_js(state)
+                goal_pose = Pose.from_list(self._last_goal_pose_list, tensor_args=self.tensor_args)
+                time_dilation_factor = float(
+                    self.get_parameter('time_dilation_factor').get_parameter_value().double_value
                 )
-                with self.lock:
-                    self._last_planned_traj = traj
-                    try:
-                        self._last_goal_pose_list = goal_pose.tolist()
-                    except Exception:
-                        pass
-                self.get_logger().info('Auto replan completed successfully (non-MPC).')
 
-                # Publish trajectory for visualization and execution
-                try:
-                    if self._display_traj_pub.get_subscription_count() > 0:
-                        display_msg = DisplayTrajectory()
-                        display_msg.trajectory.append(traj)
-                        self._display_traj_pub.publish(display_msg)
-                except Exception as exc:
-                    self.get_logger().warn(f'Failed to publish display trajectory: {exc}')
+                self.motion_gen.reset(reset_seed=False)
+                replan_result = self.motion_gen.plan_single(
+                    start_state,
+                    goal_pose,
+                    MotionGenPlanConfig(
+                        max_attempts=self.__max_attempts,
+                        enable_graph_attempt=3,
+                        time_dilation_factor=time_dilation_factor,
+                        ik_fail_return=5,
+                    ),
+                )
 
-                # Publish the updated plan to the controller directly
-                controller_traj = self._build_controller_trajectory(traj.joint_trajectory)
-                if controller_traj is not None:
+                if replan_result.success.item():
+                    traj = self.get_joint_trajectory(
+                        replan_result.optimized_plan,
+                        float(replan_result.optimized_dt.item())
+                    )
+                    with self.lock:
+                        self._last_planned_traj = traj
+                        try:
+                            self._last_goal_pose_list = goal_pose.tolist()
+                        except Exception:
+                            pass
+                    self.get_logger().info(f'Auto replan succeeded after {attempt} attempt(s).')
+
+                    # Publish trajectory for visualization and execution
                     try:
-                        self._mpc_cmd_pub.publish(controller_traj)
-                        self._controller_joint_names = list(controller_traj.joint_names)
-                        self.get_logger().info('Published auto replan trajectory to controller.')
+                        if self._display_traj_pub.get_subscription_count() > 0:
+                            display_msg = DisplayTrajectory()
+                            display_msg.trajectory.append(traj)
+                            self._display_traj_pub.publish(display_msg)
                     except Exception as exc:
-                        self.get_logger().warn(f'Failed to publish auto replan trajectory: {exc}')
-                else:
-                    self.get_logger().warn('Auto replan succeeded, but trajectory could not be matched to controller joints.')
-            else:
-                self.get_logger().warn(f'Auto replan failed: {replan_result.status}')
+                        self.get_logger().warn(f'Failed to publish display trajectory: {exc}')
+
+                    # Publish the updated plan to the controller directly
+                    controller_traj = self._build_controller_trajectory(traj.joint_trajectory)
+                    if controller_traj is not None:
+                        try:
+                            self._mpc_cmd_pub.publish(controller_traj)
+                            self._controller_joint_names = list(controller_traj.joint_names)
+                            self.get_logger().info('Published auto replan trajectory to controller.')
+                        except Exception as exc:
+                            self.get_logger().warn(f'Failed to publish auto replan trajectory: {exc}')
+                    else:
+                        self.get_logger().warn('Auto replan succeeded, but trajectory could not be matched to controller joints.')
+                    break
+
+                self.get_logger().warn(f'Auto replan failed (attempt {attempt}): {replan_result.status} — retrying...')
+                time.sleep(self._auto_replan_retry_delay)
         except Exception as exc:
             self.get_logger().error(f'Auto replan exception: {exc}')
         finally:
