@@ -117,7 +117,7 @@ class CumotionActionServer(Node):
 
 
         # === MPC params ===
-        self.declare_parameter('use_mpc', True)
+        self.declare_parameter('use_mpc', False)
         self.declare_parameter('mpc_autorun', True)
         self.declare_parameter('mpc_step_dt', 0.04) # 0.03 for pose control
         self.declare_parameter('mpc_cmd_topic', '/scaled_joint_trajectory_controller/joint_trajectory')  # change if your controller differs
