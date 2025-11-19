@@ -5,10 +5,10 @@ from copy import deepcopy
 from os import path
 import threading
 import time
-from typing import List, Optional, Sequence
 import numpy as np
 import torch
 import rclpy
+from typing import Dict, List, Sequence, Set, Tuple, Optional
 
 from curobo.geom.sdf.world import CollisionCheckerType
 from curobo.geom.types import Cuboid, Cylinder, Mesh, Sphere
@@ -43,6 +43,8 @@ from action_msgs.srv import CancelGoal
 from nvblox_msgs.srv import EsdfAndGradients
 from rclpy.action import ActionClient, ActionServer
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+import rclpy
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType, ParameterValue
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.task import Future
@@ -52,7 +54,6 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from visualization_msgs.msg import Marker
 
 from rclpy.duration import Duration
-from rcl_interfaces.msg import ParameterDescriptor, ParameterType, ParameterValue
 
 
 class CumotionActionServer(Node):
@@ -93,12 +94,25 @@ class CumotionActionServer(Node):
 
         # Debug / scaling overrides
         self.declare_parameter('override_moveit_scaling_factors', False)
-        self.declare_parameter('update_link_sphere_server', 'planner_attach_object')
         self.declare_parameter(
             'excluded_joint_names',
             ParameterValue(type=ParameterType.PARAMETER_STRING_ARRAY, string_array_value=[]),
             descriptor=ParameterDescriptor(type=ParameterType.PARAMETER_STRING_ARRAY)
         )
+        self.declare_parameter('update_link_sphere_server', 'planner_attach_object')
+        self.declare_parameter(
+            'disable_collision_link_map',
+            ParameterValue(type=ParameterType.PARAMETER_STRING_ARRAY, string_array_value=[]),
+            descriptor=ParameterDescriptor(type=ParameterType.PARAMETER_STRING_ARRAY)
+        )
+        self.declare_parameter(
+            'disable_collision_object_map',
+            ParameterValue(type=ParameterType.PARAMETER_STRING_ARRAY, string_array_value=[]),
+            descriptor=ParameterDescriptor(type=ParameterType.PARAMETER_STRING_ARRAY)
+        )
+        self.declare_parameter('enable_curobo_debug_mode', False)
+        debug_mode = self.get_parameter(
+            'enable_curobo_debug_mode').get_parameter_value().bool_value
 
         # MPPI rollout viz
         self.declare_parameter('viz_enable_mppi_rollouts', True)
@@ -204,6 +218,13 @@ class CumotionActionServer(Node):
         self.__override_moveit_scaling_factors = (
             self.get_parameter('override_moveit_scaling_factors').get_parameter_value().bool_value
         )
+        disable_map_param = self.get_parameter('disable_collision_link_map').get_parameter_value().string_array_value
+        self._disable_collision_variants = self._parse_disable_collision_link_map(disable_map_param)
+        disable_object_map_param = self.get_parameter('disable_collision_object_map').get_parameter_value().string_array_value
+        self._raw_disable_collision_object_map = self._parse_disable_collision_link_map(disable_object_map_param)
+        self._disable_collision_link_map: Dict[str, List[str]] = {}
+        self._disable_collision_object_map: Dict[str, List[str]] = {}
+        self._available_link_spheres: Set[str] = set()
 
         excluded_param = self.get_parameter('excluded_joint_names').get_parameter_value().string_array_value
         self._excluded_joint_names = set(excluded_param) if excluded_param else set()
@@ -953,6 +974,9 @@ class CumotionActionServer(Node):
         except Exception:
             pass
         self.get_logger().info('MPC initialized (MPPI).')
+        self._available_link_spheres = self._collect_available_link_spheres()
+        self._refresh_disable_collision_link_map()
+        self._refresh_disable_collision_object_map()
 
     def warmup(self):
         self.get_logger().info('warming up cuMotion, wait until ready')
@@ -1502,6 +1526,235 @@ class CumotionActionServer(Node):
 
         return True
 
+    def _collect_available_link_spheres(self) -> Set[str]:
+        kinematics = getattr(self.motion_gen, 'kinematics', None)
+        if kinematics is None:
+            return set()
+        kin_cfg = getattr(kinematics, 'kinematics_config', None)
+        if kin_cfg is None:
+            return set()
+        link_map = getattr(kin_cfg, 'link_name_to_idx_map', None)
+        if isinstance(link_map, dict):
+            return set(link_map.keys())
+        link_names = getattr(kin_cfg, 'link_names', None)
+        if isinstance(link_names, (list, tuple)):
+            return set(link_names)
+        return set()
+
+    def _refresh_disable_collision_link_map(self) -> None:
+        available_links = self._available_link_spheres
+        candidate_map: Dict[str, List[Tuple[int, List[str], str]]] = {}
+
+        for qualified_group, links in self._disable_collision_variants.items():
+            variant_part, sep, group_part = qualified_group.partition('|')
+            variant_name = variant_part.strip() if sep else ''
+            group_name = group_part.strip() if sep else variant_part.strip()
+
+            if not group_name:
+                self.get_logger().warn(
+                    "disable_collision_link_map entry '%s' results in an empty group name; skipping.",
+                    qualified_group
+                )
+                continue
+
+            filtered_links = list(links)
+            if available_links:
+                filtered_links = [link for link in links if link in available_links]
+                missing_links = sorted(set(links) - set(filtered_links))
+                if missing_links:
+                    message = (
+                        f"Ignoring {len(missing_links)} link(s) for group '{group_name}' "
+                        f"(variant '{variant_name or 'default'}') not present in current kinematics: "
+                        f"{', '.join(missing_links)}"
+                    )
+                    self.get_logger().debug(message)
+
+            if available_links and not filtered_links:
+                message = (
+                    f"No matching links for disable_collision_links group '{group_name}' "
+                    f"(variant '{variant_name or 'default'}'); skipping candidate."
+                )
+                self.get_logger().debug(message)
+                continue
+
+            match_count = len(filtered_links) if available_links else len(links)
+            candidate_map.setdefault(group_name, []).append((match_count, filtered_links, variant_name))
+
+        updated_map: Dict[str, List[str]] = {}
+        for group_name, candidates in candidate_map.items():
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            best_match_count, best_links, best_variant = candidates[0]
+            if best_match_count == 0:
+                continue
+            updated_map[group_name] = best_links
+            message = (
+                f"Selecting disable_collision_links entry for group '{group_name}' "
+                f"(variant '{best_variant or 'default'}') with {best_match_count} matching link(s)."
+            )
+            self.get_logger().debug(message)
+
+        if not updated_map and self._disable_collision_variants:
+            self.get_logger().warn(
+                "Unable to match any disable_collision_link_map entries against available link spheres; no links will be toggled."
+            )
+
+        self._disable_collision_link_map = updated_map
+
+    def _refresh_disable_collision_object_map(self) -> None:
+        raw_map = getattr(self, '_raw_disable_collision_object_map', {})
+        if not raw_map:
+            self._disable_collision_object_map = {}
+            return
+
+        available_links = self._available_link_spheres
+        updated: Dict[str, List[str]] = {}
+
+        for group_name, links in raw_map.items():
+            filtered_links = list(links)
+            if available_links:
+                filtered_links = [link for link in links if link in available_links]
+                missing = sorted(set(links) - set(filtered_links))
+                if missing:
+                    msg = (
+                        f"disable_collision_objects config for '{group_name}' skipped {len(missing)} link(s) not present in current kinematics: "
+                        + ', '.join(missing)
+                    )
+                    self.get_logger().debug(msg)
+
+            if not filtered_links:
+                self.get_logger().warn(
+                    f"disable_collision_objects config for '{group_name}' did not match any available robot links; skipping."
+                )
+                continue
+
+            updated[group_name] = filtered_links
+
+        self._disable_collision_object_map = updated
+
+    def _parse_disable_collision_link_map(self, entries: Sequence[str]) -> Dict[str, List[str]]:
+        mapping: Dict[str, List[str]] = {}
+        for raw_entry in entries or []:
+            entry = raw_entry.strip()
+            if not entry:
+                continue
+            if ':' not in entry:
+                self.get_logger().warn(
+                    f"disable_collision_link_map entry '{entry}' is missing ':' separator; expected 'group:link1,link2'."
+                )
+                continue
+            group, links_str = entry.split(':', 1)
+            group = group.strip()
+            if not group:
+                self.get_logger().warn(
+                    f"disable_collision_link_map entry '{entry}' has an empty group name; skipping."
+                )
+                continue
+            links = [link.strip() for link in links_str.split(',') if link.strip()]
+            if not links:
+                self.get_logger().warn(
+                    f"disable_collision_link_map entry '{entry}' does not list any links; skipping."
+                )
+                continue
+            mapping[group] = links
+        return mapping
+
+    def _toggle_link_collision(self, link_names: Sequence[str], enable_flag: bool) -> None:
+        if not link_names:
+            return
+        for link in link_names:
+            if self._available_link_spheres and link not in self._available_link_spheres:
+                self.get_logger().debug(
+                    "Link '%s' is not present in the current robot model; skipping collision toggle.",
+                    link
+                )
+                continue
+            try:
+                if enable_flag:
+                    self.motion_gen.kinematics.kinematics_config.enable_link_spheres(link)
+                else:
+                    self.motion_gen.kinematics.kinematics_config.disable_link_spheres(link)
+            except Exception as exc:
+                action = 'enable' if enable_flag else 'disable'
+                self.get_logger().warn(
+                    f"Failed to {action} collision checking for link '{link}': {exc}"
+                )
+
+    def _apply_disable_collision_links_if_requested(self, plan_req) -> Tuple[bool, List[str]]:
+        goal_constraints = plan_req.goal_constraints
+        if not goal_constraints:
+            return False, []
+
+        marker = goal_constraints[0].name if goal_constraints[0].name else ''
+        if marker != 'disable_collision_links':
+            return False, []
+
+        group_name = plan_req.group_name or ''
+        if not group_name:
+            self.get_logger().warn(
+                'disable_collision_links requested but group_name is empty; ignoring request.'
+            )
+            return False, []
+
+        links = self._disable_collision_link_map.get(group_name, [])
+        if not links:
+            self.get_logger().warn(
+                f"disable_collision_links requested for '{group_name}' but no links were configured in disable_collision_link_map."
+            )
+            return False, []
+
+        if self._available_link_spheres:
+            filtered_links = [link for link in links if link in self._available_link_spheres]
+            missing = sorted(set(links) - set(filtered_links))
+            if missing:
+                self.get_logger().debug(
+                    "disable_collision_links request for '%s' skipped %s link(s) not present in kinematics: %s",
+                    group_name,
+                    len(missing),
+                    ', '.join(missing)
+                )
+            links = filtered_links
+
+        if not links:
+            self.get_logger().warn(
+                f"disable_collision_links request for '{group_name}' did not match any available robot links; ignoring."
+            )
+            return False, []
+
+        self._toggle_link_collision(links, False)
+        return True, list(links)
+
+    def _apply_disable_collision_objects_if_requested(self, plan_req) -> Tuple[bool, List[str]]:
+        goal_constraints = plan_req.goal_constraints
+        if not goal_constraints:
+            return False, []
+
+        marker_found = False
+        for constraint in goal_constraints:
+            marker = constraint.name if constraint.name else ''
+            if marker == 'disable_collision_objects':
+                marker_found = True
+                break
+
+        if not marker_found:
+            return False, []
+
+        group_name = plan_req.group_name or ''
+        if not group_name:
+            self.get_logger().warn(
+                'disable_collision_objects requested but group_name is empty; ignoring request.'
+            )
+            return False, []
+
+        links = self._disable_collision_object_map.get(group_name, [])
+        if not links:
+            self.get_logger().warn(
+                f"disable_collision_objects requested for '{group_name}' but no links were configured in disable_collision_object_map."
+            )
+            return False, []
+
+        self._toggle_link_collision(links, False)
+        return True, list(links)
+
     def send_request(self, aabb_min_m, aabb_size_m):
         self.__esdf_req.visualize_esdf = True
         self.__esdf_req.update_esdf = self.__update_esdf_on_request
@@ -1755,90 +2008,100 @@ class CumotionActionServer(Node):
             self.get_logger().error('Unsupported goal constraints')
             return result
 
-        with self.lock:
-            self.planner_busy = True
+        disable_links_applied = False
+        disable_objects_applied = False
+        disabled_links: List[str] = []
+        disabled_object_links: List[str] = []
+        try:
+            disable_links_applied, disabled_links = self._apply_disable_collision_links_if_requested(plan_req)
+            disable_objects_applied, disabled_object_links = self._apply_disable_collision_objects_if_requested(plan_req)
 
-        # Generate global plan trajectory using MotionGen
-        self.motion_gen.reset(reset_seed=False)
-        motion_gen_result = self.motion_gen.plan_single(
-            start_state,
-            goal_pose,
-            MotionGenPlanConfig(
-                max_attempts=self.__max_attempts,
-                enable_graph_attempt=3,
-                time_dilation_factor=time_dilation_factor,
-                ik_fail_return=5,
-            ),
-        )
-
-        with self.lock:
-            self.planner_busy = False
-
-        result = MoveGroup.Result()
-        if motion_gen_result.success.item():
-            result.error_code.val = MoveItErrorCodes.SUCCESS
-
-            # Build a trajectory (for visualization/logging)
-            traj = self.get_joint_trajectory(
-                motion_gen_result.optimized_plan,
-                float(motion_gen_result.optimized_dt.item())
+            # Generate global plan trajectory using MotionGen
+            self.motion_gen.reset(reset_seed=False)
+            motion_gen_result = self.motion_gen.plan_single(
+                start_state,
+                goal_pose,
+                MotionGenPlanConfig(
+                    max_attempts=self.__max_attempts,
+                    enable_graph_attempt=3,
+                    time_dilation_factor=time_dilation_factor,
+                    ik_fail_return=5,
+                ),
             )
 
-            # Echo MoveIt's own start_state when provided (prevents plan-only segfaults)
-            if len(plan_req.start_state.joint_state.name) > 0:
-                result.trajectory_start = plan_req.start_state
+            with self.lock:
+                self.planner_busy = False
 
-            result.planned_trajectory = traj
-            result.planning_time = float(motion_gen_result.total_time)
-            self._last_planned_traj = traj
-            try:
-                self._last_goal_pose_list = goal_pose.tolist()
-            except Exception:
-                self._last_goal_pose_list = None
+            result = MoveGroup.Result()
+            if motion_gen_result.success.item():
+                result.error_code.val = MoveItErrorCodes.SUCCESS
 
-            goal_handle.succeed()
-
-            # Prepare MPC reference and start tracking (MoveIt execution should be disabled in your launch)
-            if self._use_mpc:
-                with self.lock:
-                    self._motion_gen_result = traj
-                    self._mpc_active = bool(self._mpc_autorun)
-                    # Force recreation of goal buffer for new global trajectory
-                    self.goal_buffer = None
-                    self._update_goal = True
-                    # Reset streaming trackers
-                    self._last_goal_idx = -1
-                    self._last_goal_s = -1.0
-                    self._s_tgt = 0.0
-                    self._precompute_mg_path(traj)
-                self.get_logger().info(
-                    f'MPC reference loaded: optimized plan={traj}; autorun={self._mpc_active}'
+                # Build a trajectory (for visualization/logging)
+                traj = self.get_joint_trajectory(
+                    motion_gen_result.optimized_plan,
+                    float(motion_gen_result.optimized_dt.item())
                 )
-        elif not motion_gen_result.valid_query:
-            self.get_logger().error(f'Invalid planning query: {motion_gen_result.status}')
-            if motion_gen_result.status == MotionGenStatus.INVALID_START_STATE_JOINT_LIMITS:
-                result.error_code.val = MoveItErrorCodes.START_STATE_INVALID
-            elif motion_gen_result.status in [
-                MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION,
-                MotionGenStatus.INVALID_START_STATE_SELF_COLLISION,
-            ]:
-                result.error_code.val = MoveItErrorCodes.START_STATE_IN_COLLISION
-            else:
-                result.error_code.val = MoveItErrorCodes.PLANNING_FAILED
-        else:
-            self.get_logger().error(f'Planning failed: {motion_gen_result.status}')
-            if motion_gen_result.status == MotionGenStatus.IK_FAIL:
-                result.error_code.val = MoveItErrorCodes.NO_IK_SOLUTION
-            else:
-                result.error_code.val = MoveItErrorCodes.PLANNING_FAILED
 
-        self.get_logger().info(
-            f'returned planning result (query, success, failure_status): '
-            f'{self.__query_count} {motion_gen_result.success.item()} {motion_gen_result.status}'
-        )
-        self.__query_count += 1
-        self.get_logger().info(f'Total execution time for execute_callback: {time.time() - start_time:.4f} seconds')
-        return result
+                # Echo MoveIt's own start_state when provided (prevents plan-only segfaults)
+                if len(plan_req.start_state.joint_state.name) > 0:
+                    result.trajectory_start = plan_req.start_state
+
+                result.planned_trajectory = traj
+                result.planning_time = float(motion_gen_result.total_time)
+                self._last_planned_traj = traj
+                try:
+                    self._last_goal_pose_list = goal_pose.tolist()
+                except Exception:
+                    self._last_goal_pose_list = None
+
+                goal_handle.succeed()
+
+                # Prepare MPC reference and start tracking (MoveIt execution should be disabled in your launch)
+                if self._use_mpc:
+                    with self.lock:
+                        self._motion_gen_result = traj
+                        self._mpc_active = bool(self._mpc_autorun)
+                        # Force recreation of goal buffer for new global trajectory
+                        self.goal_buffer = None
+                        self._update_goal = True
+                        # Reset streaming trackers
+                        self._last_goal_idx = -1
+                        self._last_goal_s = -1.0
+                        self._s_tgt = 0.0
+                        self._precompute_mg_path(traj)
+                    self.get_logger().info(
+                        f'MPC reference loaded: optimized plan={traj}; autorun={self._mpc_active}'
+                    )
+            elif not motion_gen_result.valid_query:
+                self.get_logger().error(f'Invalid planning query: {motion_gen_result.status}')
+                if motion_gen_result.status == MotionGenStatus.INVALID_START_STATE_JOINT_LIMITS:
+                    result.error_code.val = MoveItErrorCodes.START_STATE_INVALID
+                elif motion_gen_result.status in [
+                    MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION,
+                    MotionGenStatus.INVALID_START_STATE_SELF_COLLISION,
+                ]:
+                    result.error_code.val = MoveItErrorCodes.START_STATE_IN_COLLISION
+                else:
+                    result.error_code.val = MoveItErrorCodes.PLANNING_FAILED
+            else:
+                self.get_logger().error(f'Planning failed: {motion_gen_result.status}')
+                if motion_gen_result.status == MotionGenStatus.IK_FAIL:
+                    result.error_code.val = MoveItErrorCodes.NO_IK_SOLUTION
+                else:
+                    result.error_code.val = MoveItErrorCodes.PLANNING_FAILED
+
+            self.get_logger().info(
+                f'returned planning result (query, success, failure_status): '
+                f'{self.__query_count} {motion_gen_result.success.item()} {motion_gen_result.status}'
+            )
+            self.__query_count += 1
+            self.get_logger().info(f'Total execution time for execute_callback: {time.time() - start_time:.4f} seconds')
+            return result
+        finally:
+            if disable_links_applied:
+                self._toggle_link_collision(disabled_links, True)
+            if disable_objects_applied:
+                self._toggle_link_collision(disabled_object_links, True)
 
     def publish_voxels(self, voxels):
         vox_size = self.__publish_voxel_size
