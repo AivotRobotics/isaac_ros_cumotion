@@ -1910,6 +1910,34 @@ class CumotionActionServer(Node):
 
     # ------------------- Action -------------------
 
+    def _pad_with_current_joint_state(self, names, positions):
+        """
+        Take a list of joint names and positions (from MoveIt) and ensure
+        all joints from the current /joint_states buffer are present.
+
+        Any joint missing from `names` is appended with its current value.
+        """
+        # Ensure lists (not tuples) so we can append
+        names = list(names)
+        positions = list(positions)
+
+        if self.__js_buffer is None:
+            # No buffered joint state to pad with
+            return names, positions
+
+        cur_names = self.__js_buffer['joint_names']
+        cur_pos = self.__js_buffer['position']
+
+        if not cur_names or not cur_pos:
+            return names, positions
+
+        for j_name, j_pos in zip(cur_names, cur_pos):
+            if j_name not in names:
+                names.append(j_name)
+                positions.append(j_pos)
+
+        return names, positions
+
     def execute_callback(self, goal_handle):
         start_time = time.time()
 
@@ -1974,6 +2002,10 @@ class CumotionActionServer(Node):
             self.get_logger().info('Goal from joint target')
             goal_config = [jc.position for jc in plan_req.goal_constraints[0].joint_constraints]
             goal_jnames = [jc.joint_name for jc in plan_req.goal_constraints[0].joint_constraints]
+
+            # Merge MoveIt goal with current /joint_states to include missing joints
+            goal_jnames, goal_config = self._pad_with_current_joint_state(goal_jnames, goal_config)
+
             goal_state = self.motion_gen.get_active_js(
                 CuJointState.from_position(
                     position=self.tensor_args.to_device(goal_config).contiguous().view(1, -1),
