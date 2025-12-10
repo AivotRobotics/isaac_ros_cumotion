@@ -298,6 +298,13 @@ class CumotionActionServer(Node):
         self.warmup()
         self.__query_count = 0
         self.__tensor_args = self.motion_gen.tensor_args
+        # Populate link lists so disable_collision maps work even when MPC is off
+        self._available_link_spheres = self._collect_available_link_spheres()
+        self._refresh_disable_collision_link_map()
+        self._refresh_disable_collision_object_map()
+        # Track links/objects disabled for the last successful plan
+        self._last_disabled_links: List[str] = []
+        self._last_disabled_object_links: List[str] = []
 
         # === MPC state ===
         self._use_mpc = self.get_parameter('use_mpc').get_parameter_value().bool_value
@@ -318,6 +325,7 @@ class CumotionActionServer(Node):
         self._last_planned_traj: Optional[RobotTrajectory] = None
         self._last_world_update_ts = 0.0
         self.goal_buffer = None
+        self._abort_auto_replan = False
 
         # ROS I/O
         self.subscription = self.create_subscription(
@@ -426,6 +434,17 @@ class CumotionActionServer(Node):
             return False
 
         tensor_args = self.motion_gen.tensor_args
+
+        # Keep last plan's disabled links off during ESDF change checks
+        if self._last_disabled_links:
+            self._toggle_link_collision(self._last_disabled_links, False)
+        if self._last_disabled_object_links:
+            self._toggle_link_collision(self._last_disabled_object_links, False)
+
+        disabled_info = {
+            'disabled_links': self._last_disabled_links,
+            'disabled_object_links': self._last_disabled_object_links,
+        }
         for point in jt.points:
             reordered = [point.positions[i] for i in idx]
             js = CuJointState.from_position(
@@ -435,10 +454,18 @@ class CumotionActionServer(Node):
             try:
                 valid, status = self.motion_gen.check_start_state(js)
             except Exception as exc:
-                self.get_logger().warn(f'Collision check exception for stored trajectory: {exc}')
+                self.get_logger().warn(
+                    f'Collision check exception for stored trajectory: {exc}; '
+                    f'disabled={disabled_info}; joint_positions={reordered}'
+                )
                 return True
             if not valid and status == MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION:
+                self.get_logger().warn(
+                    f'World collision on stored trajectory waypoint; '
+                    f'status={status}; disabled={disabled_info}; joint_positions={reordered}'
+                )
                 return True
+
         return False
 
     def _schedule_auto_replan(self):
@@ -697,6 +724,10 @@ class CumotionActionServer(Node):
                 busy_claimed = True
 
             while True:
+                if self._abort_auto_replan:
+                    self.get_logger().info('Auto replan aborted: new goal received.')
+                    return
+
                 attempt += 1
                 js_buffer = self.__js_buffer
                 if js_buffer is None:
@@ -775,6 +806,7 @@ class CumotionActionServer(Node):
         except Exception as exc:
             self.get_logger().error(f'Auto replan exception: {exc}')
         finally:
+            self._abort_auto_replan = False
             if busy_claimed:
                 with self.lock:
                     self.planner_busy = False
@@ -1941,7 +1973,17 @@ class CumotionActionServer(Node):
     def execute_callback(self, goal_handle):
         start_time = time.time()
 
-        # TODO: Implement stopping when new goal is received
+        # If auto-replan is active, abort it to prioritize this new goal
+        if self._auto_replan_active:
+            self.get_logger().warn('New goal received; aborting auto replan.')
+            self._abort_auto_replan = True
+            # wait briefly for the worker to release the planner_busy flag
+            for _ in range(50):
+                with self.lock:
+                    if not self.planner_busy:
+                        break
+                time.sleep(0.01)
+
         if self.planner_busy:
             self.get_logger().error('Planner is busy')
             goal_handle.abort()
@@ -2044,6 +2086,14 @@ class CumotionActionServer(Node):
         disable_objects_applied = False
         disabled_links: List[str] = []
         disabled_object_links: List[str] = []
+        # Re-enable disables from the previous plan before applying new ones
+        if self._last_disabled_links:
+            self._toggle_link_collision(self._last_disabled_links, True)
+            self._last_disabled_links = []
+        if self._last_disabled_object_links:
+            self._toggle_link_collision(self._last_disabled_object_links, True)
+            self._last_disabled_object_links = []
+        plan_success = False
         try:
             disable_links_applied, disabled_links = self._apply_disable_collision_links_if_requested(plan_req)
             disable_objects_applied, disabled_object_links = self._apply_disable_collision_objects_if_requested(plan_req)
@@ -2067,6 +2117,10 @@ class CumotionActionServer(Node):
             result = MoveGroup.Result()
             if motion_gen_result.success.item():
                 result.error_code.val = MoveItErrorCodes.SUCCESS
+                plan_success = True
+                # Remember disables that were active for this successful plan
+                self._last_disabled_links = list(disabled_links) if disable_links_applied else []
+                self._last_disabled_object_links = list(disabled_object_links) if disable_objects_applied else []
 
                 # Build a trajectory (for visualization/logging)
                 traj = self.get_joint_trajectory(
@@ -2130,10 +2184,12 @@ class CumotionActionServer(Node):
             self.get_logger().info(f'Total execution time for execute_callback: {time.time() - start_time:.4f} seconds')
             return result
         finally:
-            if disable_links_applied:
-                self._toggle_link_collision(disabled_links, True)
-            if disable_objects_applied:
-                self._toggle_link_collision(disabled_object_links, True)
+            # If planning failed, restore collision toggles immediately
+            if not plan_success:
+                if disable_links_applied:
+                    self._toggle_link_collision(disabled_links, True)
+                if disable_objects_applied:
+                    self._toggle_link_collision(disabled_object_links, True)
 
     def publish_voxels(self, voxels):
         vox_size = self.__publish_voxel_size

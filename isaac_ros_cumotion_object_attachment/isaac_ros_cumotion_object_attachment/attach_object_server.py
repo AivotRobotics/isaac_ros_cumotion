@@ -59,7 +59,6 @@ import torch
 import trimesh
 from visualization_msgs.msg import Marker, MarkerArray
 
-
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -511,11 +510,13 @@ class AttachObjectServer(Node):
             if attach_object:
                 self.handle_attachment(att_obj_srv_goal_handle)
                 if self.__object_state != ObjectState.ATTACHED:
+                    self.get_logger().error('Failed to attach the object.')
                     raise RuntimeError('Failed to attach the object.')
                 self.__att_obj_result.outcome = 'Object attached'
             else:
                 self.handle_detachment(att_obj_srv_goal_handle)
                 if self.__object_state != ObjectState.DETACHED:
+                    self.get_logger().error('Failed to detach the object.')
                     raise RuntimeError('Failed to detach the object.')
                 self.__att_obj_result.outcome = 'Object Detached'
 
@@ -523,6 +524,7 @@ class AttachObjectServer(Node):
 
         except Exception as e:
 
+            self.get_logger().error(f'Exception during goal execution: {str(e)}')
             self.__att_obj_srv_fb_msg.status = f'Error during goal execution: {str(e)}'
             att_obj_srv_goal_handle.publish_feedback(self.__att_obj_srv_fb_msg)
 
@@ -536,6 +538,7 @@ class AttachObjectServer(Node):
                 self.handle_fallback(
                     att_obj_srv_goal_handle)
                 if self.__object_state == ObjectState.ATTACHED_FALLBACK:
+                    self.get_logger().info('Fallback object attached')
                     self.__att_obj_result.outcome = 'Fallback object attached'
                     att_obj_srv_goal_handle.succeed()
                 else:
@@ -583,13 +586,16 @@ class AttachObjectServer(Node):
             success, error = self.attach_object(att_obj_srv_goal_handle)
 
             if success and self.__object_spheres is not None:
+                self.get_logger().info('Object attachment successful')
                 break  # Exit loop if object attachment successfull
             elif error is not None:
+                self.get_logger().info(f'Error during sphere generation: {error}')
                 self.__att_obj_srv_fb_msg.status = (
                     f'Attachment failed due to an error: {error}')
                 att_obj_srv_goal_handle.publish_feedback(self.__att_obj_srv_fb_msg)
                 break  # Exit loop if error in sphere generation
             else:
+                self.get_logger().info('Subscriber(s) didnt recieve data on topics (cam, joint, tf)...')
                 self.__att_obj_srv_fb_msg.status = (
                     'Subscriber(s) didnt recieve data on topics (cam, joint, tf)...')
                 att_obj_srv_goal_handle.publish_feedback(
@@ -598,10 +604,12 @@ class AttachObjectServer(Node):
                 time.sleep(0.5)  # Wait 0.5s before retrying
 
         if not success:  # Only check if success is False, which covers both cases
+            self.get_logger().error('Attachment failed after maximum retries or due to a critical error.')
             self.__att_obj_srv_fb_msg.status = (
                 'Attachment failed after maximum retries or due to a critical error.')
             att_obj_srv_goal_handle.publish_feedback(self.__att_obj_srv_fb_msg)
         else:
+            self.get_logger().info('Attachment successful after retries.')
             sync_success = self.sync_object_link_spheres_across_nodes(
                 att_obj_srv_goal_handle.request.attach_object, att_obj_srv_goal_handle)
             if sync_success:
@@ -1145,12 +1153,14 @@ class AttachObjectServer(Node):
                     otherwise None.
 
         """
+        self.get_logger().info('attach_object: started processing attachment request')
         # Validate necessary data from subscribers
         if not self.has_valid_subscriber_data():
             return False, None
 
         # Handle camera transforms
         if not self.retrieve_camera_transforms(att_obj_srv_goal_handle):
+            self.get_logger().error('attach_object: failed to retrieve camera transforms')
             return False, None
 
         try:
@@ -1207,6 +1217,8 @@ class AttachObjectServer(Node):
             return True, None  # Indicate success
 
         except Exception as e:
+            # rclpy logger expects a single string; format the traceback ourselves
+            self.get_logger().error(f'attach_object: exception\n{traceback.format_exc()}')
 
             self.__att_obj_srv_fb_msg.status = f'{traceback.format_exc()}'
             att_obj_srv_goal_handle.publish_feedback(self.__att_obj_srv_fb_msg)
