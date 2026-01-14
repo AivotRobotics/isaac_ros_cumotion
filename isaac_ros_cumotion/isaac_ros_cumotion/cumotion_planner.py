@@ -760,9 +760,12 @@ class CumotionActionServer(Node):
                     goal_pose,
                     MotionGenPlanConfig(
                         max_attempts=self.__max_attempts,
-                        enable_graph_attempt=3,
-                        time_dilation_factor=time_dilation_factor,
-                        ik_fail_return=5,
+                        enable_graph_attempt=1,
+                        enable_finetune_trajopt=True,
+                        enable_graph=False,
+                        timeout=60,
+                        enable_opt=True,
+                        parallel_finetune=True,
                     ),
                 )
 
@@ -939,7 +942,7 @@ class CumotionActionServer(Node):
             num_trajopt_seeds=self.__num_trajopt_seeds,
             num_trajopt_noisy_seeds=1 if self.get_parameter('include_trajopt_retract_seed').get_parameter_value().bool_value else 2,
             trajopt_tsteps=self.__num_trajopt_time_steps,
-            trajopt_seed_ratio={'linear': 1.0, 'bias': 0.0} if self.get_parameter('include_trajopt_retract_seed').get_parameter_value().bool_value else {'linear': 0.5, 'bias': 0.5},
+            trajopt_seed_ratio={'linear': 1.0, 'bias': 0.0},
             interpolation_dt=self.__interpolation_dt,
             collision_cache=self.__collision_cache,
             collision_checker_type=CollisionCheckerType.VOXEL,
@@ -959,7 +962,7 @@ class CumotionActionServer(Node):
             particle_trajopt_file='particle_trajopt.yml',
             gradient_trajopt_file='gradient_trajopt.yml',
             finetune_trajopt_file=None,
-            interpolation_steps=1000,
+            interpolation_steps=500,
             interpolation_type=InterpolateType.LINEAR_CUDA,
             use_cuda_graph=True,
             self_collision_check=True,
@@ -1012,7 +1015,7 @@ class CumotionActionServer(Node):
 
     def warmup(self):
         self.get_logger().info('warming up cuMotion, wait until ready')
-        self.motion_gen.warmup(enable_graph=True)
+        self.motion_gen.warmup(enable_graph=True, warmup_js_trajopt=False, parallel_finetune=True)
         self.get_logger().info('cuMotion is ready for planning queries!')
 
     def viz_timer(self):
@@ -1972,6 +1975,7 @@ class CumotionActionServer(Node):
 
     def execute_callback(self, goal_handle):
         start_time = time.time()
+        self.get_logger().info(f'[trace] execute_callback start t0={start_time:.6f}')
 
         # If auto-replan is active, abort it to prioritize this new goal
         if self._auto_replan_active:
@@ -2013,6 +2017,10 @@ class CumotionActionServer(Node):
             result.error_code.val = MoveItErrorCodes.COLLISION_CHECKING_UNAVAILABLE
             self.get_logger().error('World update failed.')
             return result
+        world_update_time = time.time()
+        self.get_logger().info(
+            f'[trace] World update done in {world_update_time - start_time:.3f}s'
+        )
 
         # Start state for global planning
         if len(plan_req.start_state.joint_state.position) > 0:
@@ -2030,6 +2038,11 @@ class CumotionActionServer(Node):
                 result = MoveGroup.Result()
                 result.error_code.val = MoveItErrorCodes.FAILURE
                 return result
+            self.get_logger().info(
+                f"Start state from {self.__joint_states_topic}: "
+                f"joint_names={self.__js_buffer['joint_names']}, "
+                f"positions={self.__js_buffer['position']}"
+            )
             state = CuJointState.from_position(
                 position=self.tensor_args.to_device(self.__js_buffer['position']).unsqueeze(0),
                 joint_names=self.__js_buffer['joint_names'],
@@ -2037,6 +2050,11 @@ class CumotionActionServer(Node):
             if self.__js_buffer['velocity'] and len(self.__js_buffer['velocity']) == len(self.__js_buffer['position']):
                 state.velocity = self.tensor_args.to_device(self.__js_buffer['velocity']).unsqueeze(0)
             start_state = self.motion_gen.get_active_js(state)
+        start_state_time = time.time()
+        self.get_logger().info(
+            f'[trace] Start state ready in {start_state_time - world_update_time:.3f}s '
+            f'(since start {start_state_time - start_time:.3f}s)'
+        )
 
         # Goal (joint or pose)
         # JOINT GOAL
@@ -2081,6 +2099,11 @@ class CumotionActionServer(Node):
             result.error_code.val = MoveItErrorCodes.PLANNING_FAILED
             self.get_logger().error('Unsupported goal constraints')
             return result
+        goal_parse_time = time.time()
+        self.get_logger().info(
+            f'[trace] Goal parsed in {goal_parse_time - start_state_time:.3f}s '
+            f'(since start {goal_parse_time - start_time:.3f}s)'
+        )
 
         disable_links_applied = False
         disable_objects_applied = False
@@ -2100,15 +2123,24 @@ class CumotionActionServer(Node):
 
             # Generate global plan trajectory using MotionGen
             self.motion_gen.reset(reset_seed=False)
+            plan_call_start = time.time()
             motion_gen_result = self.motion_gen.plan_single(
                 start_state,
                 goal_pose,
                 MotionGenPlanConfig(
                     max_attempts=self.__max_attempts,
-                    enable_graph_attempt=3,
-                    time_dilation_factor=time_dilation_factor,
-                    ik_fail_return=5,
+                    enable_graph_attempt=1,
+                    enable_finetune_trajopt=True,
+                    enable_graph=False,
+                    timeout=60,
+                    enable_opt=True,
+                    parallel_finetune=True,
                 ),
+            )
+            plan_call_end = time.time()
+            self.get_logger().info(
+                f'[trace] plan_single returned in {plan_call_end - plan_call_start:.3f}s '
+                f'(since start {plan_call_end - start_time:.3f}s)'
             )
 
             with self.lock:

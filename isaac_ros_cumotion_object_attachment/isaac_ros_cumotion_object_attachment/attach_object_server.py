@@ -452,15 +452,15 @@ class AttachObjectServer(Node):
             if attach_object:
                 return True
             else:
-                self.get_logger().error(
+                self.get_logger().warning(
                     'Goal to detach object received, but the object is already detached.')
-                return False
+                return True
 
         elif self.__object_state in [ObjectState.ATTACHED, ObjectState.ATTACHED_FALLBACK]:
             if attach_object:
-                self.get_logger().error(
-                    'Detach the current object before attempting to attach the new one.')
-                return False
+                self.get_logger().warning(
+                    'Goal to attach object received, but an object is already attached.')
+                return True
             else:
                 return True
 
@@ -508,12 +508,28 @@ class AttachObjectServer(Node):
 
         try:
             if attach_object:
+                if self.__object_state in [ObjectState.ATTACHED, ObjectState.ATTACHED_FALLBACK]:
+                    self.__att_obj_srv_fb_msg.status = (
+                        'Object already attached; skipping attachment.')
+                    att_obj_srv_goal_handle.publish_feedback(
+                        self.__att_obj_srv_fb_msg)
+                    self.__att_obj_result.outcome = 'Object already attached'
+                    att_obj_srv_goal_handle.succeed()
+                    return self.__att_obj_result
                 self.handle_attachment(att_obj_srv_goal_handle)
                 if self.__object_state != ObjectState.ATTACHED:
                     self.get_logger().error('Failed to attach the object.')
                     raise RuntimeError('Failed to attach the object.')
                 self.__att_obj_result.outcome = 'Object attached'
             else:
+                if self.__object_state == ObjectState.DETACHED:
+                    self.__att_obj_srv_fb_msg.status = (
+                        'Object already detached; skipping detachment.')
+                    att_obj_srv_goal_handle.publish_feedback(
+                        self.__att_obj_srv_fb_msg)
+                    self.__att_obj_result.outcome = 'Object already detached'
+                    att_obj_srv_goal_handle.succeed()
+                    return self.__att_obj_result
                 self.handle_detachment(att_obj_srv_goal_handle)
                 if self.__object_state != ObjectState.DETACHED:
                     self.get_logger().error('Failed to detach the object.')
